@@ -1,68 +1,71 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { onAuthStateChanged, signOut } from "firebase/auth";
-import { auth } from "./firebase";
+import { doc, onSnapshot } from "firebase/firestore";
 import { AnimatePresence, motion } from "framer-motion";
+import { auth, db } from "./firebase";
+
 import TopBar from "./components/TopBar.jsx";
 import Login from "./pages/Login.jsx";
 import Signup from "./pages/Signup.jsx";
-import Dashboard from "./pages/Dashboard.jsx";
+import Home from "./pages/Home.jsx";
+import Jobs from "./pages/Jobs.jsx";
+import Profile from "./pages/Profile.jsx";
 
 export default function App() {
   const [user, setUser] = useState(null);
   const [mode, setMode] = useState("login");
   const [loading, setLoading] = useState(true);
+  const [page, setPage] = useState("home");
+  const [userMeta, setUserMeta] = useState(null);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (u) => {
       setUser(u);
       setLoading(false);
+      if (!u) setPage("home");
     });
     return () => unsub();
   }, []);
 
-  return (
-    <div className="min-h-screen bg-glow">
-      <TopBar user={user} onLogout={() => signOut(auth)} />
+  useEffect(() => {
+    if (!user) return;
+    const ref = doc(db, "users", user.uid);
+    return onSnapshot(ref, (snap) => setUserMeta(snap.exists() ? snap.data() : null));
+  }, [user]);
 
-      <div className="max-w-5xl mx-auto px-4 py-10">
-        {loading ? (
-          <div className="grid place-items-center py-24 text-zinc-500">Loading…</div>
-        ) : (
+  const content = useMemo(() => {
+    if (loading) return <div className="py-24 text-center text-gray-500">Loading…</div>;
+    if (!user) return mode === "login" ? <Login onSwitch={() => setMode("signup")} /> : <Signup onSwitch={() => setMode("login")} />;
+
+    if (page === "jobs") return <Jobs user={user} />;
+    if (page === "profile") return <Profile user={user} userMeta={userMeta} />;
+    return <Home user={user} userMeta={userMeta} />;
+  }, [loading, user, mode, page, userMeta]);
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <TopBar 
+        user={user} 
+        userMeta={userMeta} 
+        page={page} 
+        setPage={setPage} 
+        onLogout={() => signOut(auth)} 
+      />
+      <main className="py-10">
+        <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
           <AnimatePresence mode="wait">
-            {user ? (
-              <motion.div
-                key="dash"
-                initial={{ opacity: 0, y: 14 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                transition={{ duration: 0.25 }}
-              >
-                <Dashboard user={user} />
-              </motion.div>
-            ) : mode === "login" ? (
-              <motion.div
-                key="login"
-                initial={{ opacity: 0, y: 14 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                transition={{ duration: 0.25 }}
-              >
-                <Login onSwitch={() => setMode("signup")} />
-              </motion.div>
-            ) : (
-              <motion.div
-                key="signup"
-                initial={{ opacity: 0, y: 14 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                transition={{ duration: 0.25 }}
-              >
-                <Signup onSwitch={() => setMode("login")} />
-              </motion.div>
-            )}
+            <motion.div
+              key={`${user ? "authed" : "anon"}-${page}-${mode}`}
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              transition={{ duration: 0.22 }}
+            >
+              {content}
+            </motion.div>
           </AnimatePresence>
-        )}
-      </div>
+        </div>
+      </main>
     </div>
   );
 }

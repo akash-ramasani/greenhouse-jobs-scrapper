@@ -1,27 +1,33 @@
 @import "tailwindcss";
 
-
 :root {
-  color-scheme: dark;
+  color-scheme: light;
 }
 
-html, body, #root {
-  height: 100%;
+html, body, #root { 
+  height: 100%; 
 }
 
 body {
-  @apply bg-black text-zinc-100 antialiased;
+  /* Set Ubuntu as the primary font */
+  font-family: 'Ubuntu', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  @apply bg-white text-gray-900 antialiased;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
 }
 
-/* Minimal reusable surfaces */
-.glass {
-  @apply bg-zinc-900/60 border border-zinc-800/70 backdrop-blur rounded-2xl;
+/* Custom Utilities */
+.section-grid {
+  @apply grid grid-cols-1 gap-x-8 gap-y-10 border-b border-gray-900/10 pb-12 md:grid-cols-3;
 }
 
-/* Subtle animated grid glow */
-.bg-glow {
-  background:
-    radial-gradient(800px 400px at 20% 0%, rgba(255,255,255,0.08), transparent 55%),
-    radial-gradient(700px 450px at 90% 10%, rgba(255,255,255,0.06), transparent 60%),
-    linear-gradient(to bottom, rgba(255,255,255,0.03), transparent 40%);
+.input-standard {
+  @apply block w-full rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm shadow-sm transition-all focus:border-indigo-500 focus:outline-none focus:ring-4 focus:ring-indigo-500/10;
+}
+
+.btn-primary {
+  @apply flex items-center justify-center rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white shadow-md shadow-indigo-200 transition-all hover:bg-indigo-700 hover:shadow-lg active:scale-[0.98] disabled:opacity-50;
+}
+
+.btn-secondary {
+  @apply rounded-md bg-white px-3 py-2 text-sm font-semibold text-gray-900 shadow-sm ring-1 ring-inset ring-gray-300 hover:bg-gray-50 transition-all;
 }
