@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { sendPasswordResetEmail } from "firebase/auth";
 import { auth } from "../firebase";
-import { useToast } from "../components/toast/ToastProvider.jsx"; // Import the Toast hook
+import { useToast } from "../components/Toast/ToastProvider.jsx"; // Import the Toast hook
 
 export default function ForgotPassword({ onBack }) {
   const [email, setEmail] = useState("");

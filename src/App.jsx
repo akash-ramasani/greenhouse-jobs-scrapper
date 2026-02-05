@@ -16,7 +16,7 @@ import Profile from "./pages/Profile.jsx";
 import FetchHistory from "./pages/FetchHistory.jsx";
 
 // Import ToastProvider for the app's toasts
-import ToastProvider from "./components/toast/ToastProvider.jsx";
+import { ToastProvider } from "./components/Toast/ToastProvider.jsx";
 
 export default function App() {
   const [user, setUser] = useState(null);

@@ -1,7 +1,7 @@
 // src/components/TopBar.jsx
 import React, { useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { useToast } from "./toast/ToastProvider.jsx"; // Import the Toast hook
+import { useToast } from "./Toast/ToastProvider.jsx"; // Import the Toast hook
 
 export default function TopBar({ user, userMeta, page, setPage, onLogout }) {
   const [isMenuOpen, setIsMenuOpen] = useState(false);

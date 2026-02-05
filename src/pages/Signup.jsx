@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { createUserWithEmailAndPassword } from "firebase/auth";
 import { auth, db } from "../firebase";
 import { doc, setDoc, serverTimestamp } from "firebase/firestore";
-import { useToast } from "../components/toast/ToastProvider.jsx"; // Added Import
+import { useToast } from "../components/Toast/ToastProvider.jsx"; // Added Import
 
 export default function Signup({ onSwitch }) {
   const [email, setEmail] = useState("");
