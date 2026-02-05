@@ -137,7 +137,6 @@ async function pollForUser(uid, runType = "scheduled") {
           const existing = await jobRef.get();
           if (existing.exists) continue; // ✅ only add new
 
-          // Ensure company doc exists / updated
           batch.set(
             companyRef,
             {
@@ -150,7 +149,6 @@ async function pollForUser(uid, runType = "scheduled") {
           );
           ops++;
 
-          // job doc
           batch.set(jobRef, {
             title: job.title || job.name || job.position || null,
             absolute_url: job.absolute_url || job.url || job.apply_url || null,
@@ -163,7 +161,6 @@ async function pollForUser(uid, runType = "scheduled") {
             companyKey,
             updatedAtIso: job.updated_at || null,
 
-            // when we first saw it
             firstSeenAt: admin.firestore.FieldValue.serverTimestamp(),
           });
           ops++;
@@ -228,7 +225,7 @@ async function pollForUser(uid, runType = "scheduled") {
   return { newCount: totalNewCount, feeds: activeFeeds.length };
 }
 
-// scheduled every 30 min
+// ----------------- scheduled -----------------
 exports.pollGreenhouseFeeds = functions.pubsub
   .schedule("every 30 minutes")
   .timeZone("Etc/UTC")
@@ -256,7 +253,7 @@ exports.pollGreenhouseFeeds = functions.pubsub
     return null;
   });
 
-// manual onCall
+// ----------------- manual onCall -----------------
 exports.pollNow = functions.https.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError("unauthenticated", "User must be authenticated to poll now.");
@@ -271,4 +268,77 @@ exports.pollNow = functions.https.onCall(async (data, context) => {
     console.error("Manual poll error", uid, err?.message || err);
     throw new functions.https.HttpsError("internal", "Polling failed: " + String(err?.message || err));
   }
+});
+
+// ----------------- MIGRATION (old users/{uid}/jobs -> companies/{company}/jobs) -----------------
+exports.migrateLegacyJobsToCompanies = functions.https.onCall(async (data, context) => {
+  if (!context.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "User must be authenticated.");
+  }
+
+  const uid = context.auth.uid;
+  const userRef = db.collection("users").doc(uid);
+
+  // read legacy jobs
+  const legacySnap = await userRef.collection("jobs").get();
+  if (legacySnap.empty) {
+    return { ok: true, migrated: 0, note: "No legacy jobs found at users/{uid}/jobs" };
+  }
+
+  let migrated = 0;
+
+  // batch in chunks
+  let batch = db.batch();
+  let ops = 0;
+
+  for (const docSnap of legacySnap.docs) {
+    const legacy = docSnap.data() || {};
+    const raw = legacy.raw || {};
+    const source = legacy.source || "";
+    const companyName = (legacy.companyName || raw.company_name || "Unknown").trim();
+    const companyKey = safeCompanyKey(companyName, source);
+
+    const companyRef = userRef.collection("companies").doc(companyKey);
+    const jobRef = companyRef.collection("jobs").doc(docSnap.id);
+
+    // if already migrated, skip
+    const exists = await jobRef.get();
+    if (exists.exists) continue;
+
+    batch.set(
+      companyRef,
+      {
+        companyName,
+        companyKey,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    ops++;
+
+    batch.set(
+      jobRef,
+      {
+        ...legacy,
+        companyName,
+        companyKey,
+        updatedAtIso: legacy.updatedAtIso || raw.updated_at || null,
+      },
+      { merge: true }
+    );
+    ops++;
+
+    migrated++;
+
+    if (ops >= 400) {
+      await batch.commit();
+      batch = db.batch();
+      ops = 0;
+    }
+  }
+
+  if (ops > 0) await batch.commit();
+
+  return { ok: true, migrated };
 });
