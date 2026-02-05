@@ -9,7 +9,7 @@ const admin = require("firebase-admin");
 admin.initializeApp();
 const db = admin.firestore();
 
-// Helper: normalize job array from feed JSON
+// ---------- helpers ----------
 function normalizeJobsFromFeedJson(json) {
   if (Array.isArray(json)) return json;
   if (json && Array.isArray(json.jobs)) return json.jobs;
@@ -17,11 +17,31 @@ function normalizeJobsFromFeedJson(json) {
   return [];
 }
 
+// Stable job doc id
 function safeJobKey(sourceUrl, job) {
-  // Use stable id when available
   if (job && (job.id || job._id)) return String(job.id || job._id);
   const base = `${sourceUrl}::${job?.absolute_url || ""}::${job?.title || ""}`;
   return Buffer.from(base).toString("base64").replace(/=+$/g, "");
+}
+
+// Company doc id
+function safeCompanyKey(companyName, fallbackUrl) {
+  const raw = (companyName || "").trim();
+  if (raw) {
+    return raw
+      .toLowerCase()
+      .replace(/&/g, "and")
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 80) || Buffer.from(raw).toString("base64").replace(/=+$/g, "");
+  }
+
+  // fallback: derive from URL if company missing
+  const u = String(fallbackUrl || "").toLowerCase();
+  // common greenhouse pattern: /v1/boards/<slug>/jobs
+  const m = u.match(/\/v1\/boards\/([^/]+)\//);
+  if (m?.[1]) return m[1].replace(/[^a-z0-9\-]+/g, "-").slice(0, 80);
+  return Buffer.from(u).toString("base64").replace(/=+$/g, "").slice(0, 80);
 }
 
 async function fetchJson(url) {
@@ -29,24 +49,23 @@ async function fetchJson(url) {
     method: "GET",
     headers: { "user-agent": "job-watch-bot/1.0" },
   });
-  if (!res.ok) {
-    throw new Error(`Fetch failed ${res.status} for ${url}`);
-  }
+  if (!res.ok) throw new Error(`Fetch failed ${res.status} for ${url}`);
   return await res.json();
 }
 
 /**
- * Poll feeds for single user -> writes new jobs into users/{uid}/jobs
- * Logs each run into users/{uid}/fetchRuns/{runId}
+ * Poll feeds for single user -> writes new jobs into:
+ * users/{uid}/companies/{companyKey}/jobs/{jobKey}
  *
  * IMPORTANT:
  * - Only adds new jobs (does not update old docs)
  * - Skips archived feeds (feeds with archivedAt)
+ * - Logs each run into users/{uid}/fetchRuns/{runId}
  */
 async function pollForUser(uid, runType = "scheduled") {
   const userRef = db.collection("users").doc(uid);
 
-  // Create run log doc early
+  // create run log doc early
   const runRef = userRef.collection("fetchRuns").doc();
   const startedAtMs = Date.now();
 
@@ -67,7 +86,6 @@ async function pollForUser(uid, runType = "scheduled") {
   const feedsSnap = await userRef.collection("feeds").get();
 
   if (feedsSnap.empty) {
-    // update user lastFetchAt even if there are no feeds
     await userRef.set({ lastFetchAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
 
     await runRef.set(
@@ -85,14 +103,12 @@ async function pollForUser(uid, runType = "scheduled") {
     return { newCount: 0, feeds: 0 };
   }
 
-  // Include docs but skip archived in workers
   const feeds = feedsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
   let totalNewCount = 0;
   let errorsCount = 0;
   const errorSamples = [];
 
-  // Limit concurrency per user
   const concurrency = 3;
   let i = 0;
 
@@ -101,50 +117,69 @@ async function pollForUser(uid, runType = "scheduled") {
       const idx = i++;
       const feed = feeds[idx];
 
-      // Skip archived feeds
+      // skip archived feeds
       if (feed.archivedAt) continue;
 
       const url = feed.url;
       const feedRef = userRef.collection("feeds").doc(feed.id);
-      const jobsCol = userRef.collection("jobs");
 
       try {
         const json = await fetchJson(url);
         const jobs = normalizeJobsFromFeedJson(json);
 
+        // We will batch writes (jobs + optional company doc updates)
         let batch = db.batch();
         let ops = 0;
         let newCount = 0;
 
-        // For small feeds this per-doc existence check is fine.
         for (const job of jobs) {
+          // derive company
+          const companyName = (job.company_name || feed.company || "").trim() || "Unknown";
+          const companyKey = safeCompanyKey(companyName, url);
+
+          const companyRef = userRef.collection("companies").doc(companyKey);
+          const jobsCol = companyRef.collection("jobs");
+
           const jobKey = safeJobKey(url, job);
           const jobRef = jobsCol.doc(jobKey);
 
+          // per-job existence check (keeps “only add new” behavior)
           const existing = await jobRef.get();
-          if (existing.exists) continue; // ✅ only add new jobs
+          if (existing.exists) continue;
 
-          const payload = {
+          // set company doc (idempotent)
+          batch.set(
+            companyRef,
+            {
+              companyName,
+              companyKey,
+              createdAt: admin.firestore.FieldValue.serverTimestamp(),
+              lastSeenAt: admin.firestore.FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+          );
+          ops++;
+
+          // set job doc
+          batch.set(jobRef, {
             title: job.title || job.name || job.position || null,
             absolute_url: job.absolute_url || job.url || job.apply_url || null,
-
-            // normalized top-level fields for UI
-            companyName: job.company_name || null,
             locationName: job?.location?.name || job.location_name || null,
-
-            // keep full job object for filtering/sorting
-            raw: job,
             source: url,
+            raw: job,
+
+            // for your UI
+            companyName,
+            companyKey,
+            updatedAtIso: job.updated_at || null,
 
             // when we first saw it
             firstSeenAt: admin.firestore.FieldValue.serverTimestamp(),
-          };
-
-          batch.set(jobRef, payload);
+          });
           ops++;
           newCount++;
 
-          if (ops >= 450) {
+          if (ops >= 400) {
             await batch.commit();
             batch = db.batch();
             ops = 0;
@@ -168,8 +203,6 @@ async function pollForUser(uid, runType = "scheduled") {
         errorsCount++;
         const msg = String(err?.message || err);
 
-        console.error("Feed error", uid, url, msg);
-
         if (errorSamples.length < 5) {
           errorSamples.push({
             feedId: feed.id,
@@ -177,6 +210,8 @@ async function pollForUser(uid, runType = "scheduled") {
             message: msg,
           });
         }
+
+        console.error("Feed error", uid, url, msg);
 
         await feedRef.set(
           {
@@ -191,15 +226,15 @@ async function pollForUser(uid, runType = "scheduled") {
 
   await Promise.all(workers);
 
-  // update user lastFetchAt
   await userRef.set({ lastFetchAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
 
   // finalize run log
+  const activeFeedsCount = feeds.filter((f) => !f.archivedAt).length;
   await runRef.set(
     {
       finishedAt: admin.firestore.FieldValue.serverTimestamp(),
       durationMs: Date.now() - startedAtMs,
-      feedsCount: feeds.filter((f) => !f.archivedAt).length,
+      feedsCount: activeFeedsCount,
       newCount: totalNewCount,
       errorsCount,
       errorSamples,
@@ -207,10 +242,10 @@ async function pollForUser(uid, runType = "scheduled") {
     { merge: true }
   );
 
-  return { newCount: totalNewCount, feeds: feeds.filter((f) => !f.archivedAt).length };
+  return { newCount: totalNewCount, feeds: activeFeedsCount };
 }
 
-// Scheduled: every 30 minutes - polls all users
+// Scheduled: every 30 minutes
 exports.pollGreenhouseFeeds = functions.pubsub
   .schedule("every 30 minutes")
   .timeZone("Etc/UTC")
@@ -218,7 +253,6 @@ exports.pollGreenhouseFeeds = functions.pubsub
     const usersSnap = await db.collection("users").get();
     if (usersSnap.empty) return null;
 
-    // Limit concurrency across users
     const userDocs = usersSnap.docs;
     const concurrency = 5;
     let i = 0;
@@ -239,7 +273,7 @@ exports.pollGreenhouseFeeds = functions.pubsub
     return null;
   });
 
-// Manual: onCall - authenticated user can trigger polling for their account only
+// Manual: onCall
 exports.pollNow = functions.https.onCall(async (data, context) => {
   if (!context.auth) {
     throw new functions.https.HttpsError("unauthenticated", "User must be authenticated to poll now.");
