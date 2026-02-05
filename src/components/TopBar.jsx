@@ -1,9 +1,17 @@
 // src/components/TopBar.jsx
 import React, { useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
+import { useToast } from "./toast/ToastProvider.jsx"; // Import the Toast hook
 
 export default function TopBar({ user, userMeta, page, setPage, onLogout }) {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const { showToast } = useToast(); // Initialize toast
+
+  // Handle logout with a feedback toast
+  const handleLogoutClick = () => {
+    onLogout();
+    showToast("Signed out successfully", "success");
+  };
 
   return (
     <nav className="sticky top-0 z-50 w-full border-b border-gray-200 bg-white/80 backdrop-blur-md">
@@ -38,7 +46,7 @@ export default function TopBar({ user, userMeta, page, setPage, onLogout }) {
                     {userMeta?.firstName || "User"}
                   </span>
                   <button
-                    onClick={onLogout}
+                    onClick={handleLogoutClick} // Updated to use the wrapper
                     className="text-[11px] font-bold uppercase tracking-wider text-gray-400 hover:text-indigo-600 transition-colors"
                   >
                     Sign Out &rarr;
@@ -67,7 +75,13 @@ export default function TopBar({ user, userMeta, page, setPage, onLogout }) {
               <MobileNavButton active={page === "jobs"} onClick={() => { setPage("jobs"); setIsMenuOpen(false); }}>Jobs</MobileNavButton>
               <MobileNavButton active={page === "history"} onClick={() => { setPage("history"); setIsMenuOpen(false); }}>History</MobileNavButton>
               <MobileNavButton active={page === "profile"} onClick={() => { setPage("profile"); setIsMenuOpen(false); }}>Settings</MobileNavButton>
-              <button onClick={onLogout} className="w-full mt-4 rounded-lg bg-gray-50 px-4 py-3 text-left text-sm font-semibold text-red-600">
+              <button 
+                onClick={() => {
+                  handleLogoutClick();
+                  setIsMenuOpen(false);
+                }} 
+                className="w-full mt-4 rounded-lg bg-gray-50 px-4 py-3 text-left text-sm font-semibold text-red-600"
+              >
                 Sign Out
               </button>
             </div>
@@ -87,7 +101,12 @@ function NavButton({ active, children, onClick }) {
       }`}
     >
       {children}
-      {active && <motion.div layoutId="activeNav" className="absolute bottom-[-22px] left-0 right-0 h-[2px] bg-indigo-600" />}
+      {active && (
+        <motion.div 
+          layoutId="activeNav" 
+          className="absolute bottom-[-22px] left-0 right-0 h-[2px] bg-indigo-600" 
+        />
+      )}
     </button>
   );
 }

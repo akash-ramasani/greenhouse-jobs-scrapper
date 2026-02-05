@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import { createUserWithEmailAndPassword } from "firebase/auth";
 import { auth, db } from "../firebase";
 import { doc, setDoc, serverTimestamp } from "firebase/firestore";
+import { useToast } from "../components/toast/ToastProvider"; // Added Import
 
 export default function Signup({ onSwitch }) {
   const [email, setEmail] = useState("");
@@ -11,6 +12,8 @@ export default function Signup({ onSwitch }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
+  const { showToast } = useToast(); // Initialize Toast
+
   async function onSubmit(e) {
     e.preventDefault();
     setErr("");
@@ -18,7 +21,6 @@ export default function Signup({ onSwitch }) {
     try {
       const cred = await createUserWithEmailAndPassword(auth, email.trim(), password);
       
-      // Initialize the user document with root-level fields for easy iteration
       await setDoc(doc(db, "users", cred.user.uid), {
         email: cred.user.email,
         firstName: firstName.trim(),
@@ -27,8 +29,12 @@ export default function Signup({ onSwitch }) {
         createdAt: serverTimestamp(),
         lastFetchAt: null
       }, { merge: true });
+
+      showToast("Account created successfully!", "success");
     } catch (e2) {
-      setErr(e2.message || "Signup failed");
+      const errorMessage = e2.message || "Signup failed";
+      setErr(errorMessage);
+      showToast(errorMessage, "error");
     } finally {
       setBusy(false);
     }
@@ -36,19 +42,13 @@ export default function Signup({ onSwitch }) {
 
   return (
     <div className="flex h-screen w-full overflow-hidden bg-white">
-      {/* Left Section: Centered Form Container */}
       <div className="flex w-full flex-col justify-center px-4 py-12 sm:px-6 lg:w-[45%] lg:flex-none lg:px-20 xl:px-24">
         <div className="mx-auto w-full max-w-sm">
           <div>
-            <h2 className="text-3xl font-bold tracking-tight text-gray-900">
-              Create account
-            </h2>
+            <h2 className="text-3xl font-bold tracking-tight text-gray-900">Create account</h2>
             <p className="mt-2 text-sm text-gray-500">
               Already have an account?{' '}
-              <button 
-                onClick={onSwitch} 
-                className="font-semibold text-indigo-600 hover:text-indigo-500"
-              >
+              <button onClick={onSwitch} className="font-semibold text-indigo-600 hover:text-indigo-500">
                 Sign in instead
               </button>
             </p>
@@ -56,7 +56,6 @@ export default function Signup({ onSwitch }) {
 
           <div className="mt-10">
             <form onSubmit={onSubmit} className="space-y-6">
-              {/* Name Fields Row */}
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium text-gray-900">First name</label>
@@ -127,7 +126,6 @@ export default function Signup({ onSwitch }) {
         </div>
       </div>
 
-      {/* Right Section: Visual Panel */}
       <div className="relative hidden w-0 flex-1 lg:block">
         <img
           alt="Clean workspace"
