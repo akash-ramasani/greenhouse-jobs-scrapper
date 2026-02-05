@@ -1,7 +1,7 @@
 // src/pages/FetchHistory.jsx
-import React, { useEffect, useMemo, useState } from "react";
-import { collection, limit, onSnapshot, orderBy, query } from "firebase/firestore";
+import React, { useEffect, useState } from "react";
 import { db } from "../firebase";
+import { collection, query, orderBy, limit, onSnapshot } from "firebase/firestore";
 
 function fmtDateTime(ts) {
   if (!ts?.toDate) return "—";
@@ -47,7 +47,7 @@ export default function FetchHistory({ user }) {
     });
   }, [user.uid]);
 
-  const rows = useMemo(() => runs, [runs]);
+  const rows = runs;
 
   return (
     <div className="space-y-8 py-10" style={{ fontFamily: "Ubuntu, sans-serif" }}>
@@ -58,7 +58,6 @@ export default function FetchHistory({ user }) {
         </p>
       </div>
 
-      {/* Card styled like Active Feeds */}
       <div className="overflow-hidden bg-white shadow-sm ring-1 ring-gray-200 sm:rounded-xl">
         <div className="px-4 py-4 sm:px-6 border-b border-gray-100">
           <h3 className="text-sm font-semibold text-gray-900">Recent Runs</h3>
@@ -70,15 +69,8 @@ export default function FetchHistory({ user }) {
         <ul className="divide-y divide-gray-100">
           {rows.map((r) => {
             const isOpen = openId === r.id;
-            const isScheduled = r.runType === "scheduled";
-            const badge = isScheduled ? "Scheduled" : "Manual";
-            const badgeCls = isScheduled
-              ? "bg-gray-100 text-gray-700 ring-gray-200"
-              : "bg-indigo-50 text-indigo-700 ring-indigo-100";
-
-            const errorsCount = r.errorsCount || 0;
-            const feedsCount = r.feedsCount ?? 0;
-            const newCount = r.newCount ?? 0;
+            const badge = r.runType === "scheduled" ? "Scheduled" : "Manual";
+            const badgeCls = r.runType === "scheduled" ? "bg-gray-100 text-gray-700 ring-gray-200" : "bg-indigo-50 text-indigo-700 ring-indigo-100";
 
             return (
               <li key={r.id} className="px-4 py-5 sm:px-6 hover:bg-gray-50 transition-colors">
@@ -99,26 +91,28 @@ export default function FetchHistory({ user }) {
                       <span className="text-sm text-gray-600">
                         {fmtDateTime(r.startedAt)}
                       </span>
-
-                      {errorsCount ? (
-                        <>
-                          <span className="text-gray-300">|</span>
-                          <span className="text-sm font-semibold text-red-700">
-                            {errorsCount} error{errorsCount === 1 ? "" : "s"}
-                          </span>
-                        </>
-                      ) : null}
                     </div>
 
                     {/* Second line */}
                     <div className="mt-2 text-sm text-gray-700">
-                      Fetched <span className="font-semibold">{feedsCount}</span> feed(s) • Found{" "}
-                      <span className="font-semibold">{newCount}</span> new job(s) • Duration{" "}
+                      Fetched <span className="font-semibold">{r.feedsCount}</span> feed(s) • Found{" "}
+                      <span className="font-semibold">{r.newCount}</span> new job(s) • Duration{" "}
                       <span className="font-semibold">{fmtDuration(r.durationMs)}</span>
                     </div>
 
+                    {isOpen && !r.errorSamples?.length ? (
+                      <div className="mt-4 rounded-lg bg-green-50 ring-1 ring-inset ring-green-100 p-4">
+                        <div className="text-xs font-bold uppercase tracking-widest text-green-700">
+                          No errors in this run
+                        </div>
+                        <div className="mt-2 text-sm text-green-800">
+                          All feeds polled successfully.
+                        </div>
+                      </div>
+                    ) : null}
+
                     {/* Expanded error samples */}
-                    {isOpen && Array.isArray(r.errorSamples) && r.errorSamples.length ? (
+                    {isOpen && r.errorSamples?.length > 0 && (
                       <div className="mt-4 rounded-lg bg-red-50 ring-1 ring-inset ring-red-100 p-4">
                         <div className="text-xs font-bold uppercase tracking-widest text-red-700">
                           Error samples
@@ -132,26 +126,13 @@ export default function FetchHistory({ user }) {
                           ))}
                         </ul>
                       </div>
-                    ) : null}
-
-                    {isOpen && (!r.errorSamples || !r.errorSamples.length) ? (
-                      <div className="mt-4 rounded-lg bg-green-50 ring-1 ring-inset ring-green-100 p-4">
-                        <div className="text-xs font-bold uppercase tracking-widest text-green-700">
-                          No errors in this run
-                        </div>
-                        <div className="mt-2 text-sm text-green-800">
-                          All feeds polled successfully.
-                        </div>
-                      </div>
-                    ) : null}
+                    )}
                   </div>
 
-                  {/* Right action (like Active Feeds "ARCHIVE") */}
+                  {/* Right action */}
                   <button
                     onClick={() => setOpenId(isOpen ? null : r.id)}
-                    className={`text-xs font-bold uppercase tracking-wider ${
-                      isOpen ? "text-gray-600 hover:text-gray-900" : errorsCount ? "text-red-600 hover:text-red-800" : "text-indigo-600 hover:text-indigo-800"
-                    }`}
+                    className={`text-xs font-bold uppercase tracking-wider ${isOpen ? "text-gray-600 hover:text-gray-900" : r.errorsCount ? "text-red-600 hover:text-red-800" : "text-indigo-600 hover:text-indigo-800"}`}
                   >
                     {isOpen ? "Hide" : "View"}
                   </button>
@@ -159,12 +140,11 @@ export default function FetchHistory({ user }) {
               </li>
             );
           })}
-
-          {!rows.length ? (
+          {!rows.length && (
             <li className="px-4 py-12 text-center text-sm text-gray-500">
               No fetch runs yet. Click “Check for new jobs now” or wait for the scheduled poll.
             </li>
-          ) : null}
+          )}
         </ul>
       </div>
     </div>

@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { signInWithEmailAndPassword } from "firebase/auth";
 import { auth } from "../firebase";
+import { useToast } from "../components/toast/ToastProvider"; // Import the Toast hook
 
 export default function Login({ onSwitch, onForgot }) {
   const [email, setEmail] = useState("");
@@ -8,14 +9,18 @@ export default function Login({ onSwitch, onForgot }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
+  const { showToast } = useToast(); // Using the showToast hook
+
   async function onSubmit(e) {
     e.preventDefault();
     setErr("");
     setBusy(true);
     try {
       await signInWithEmailAndPassword(auth, email.trim(), password);
+      showToast("Logged in successfully!", "success"); // Success toast
     } catch (e2) {
       setErr(e2.message || "Login failed");
+      showToast("Login failed. Please try again.", "error"); // Error toast
     } finally {
       setBusy(false);
     }

@@ -5,6 +5,7 @@ import { doc, onSnapshot } from "firebase/firestore";
 import { AnimatePresence, motion } from "framer-motion";
 import { auth, db } from "./firebase";
 
+// Importing components
 import TopBar from "./components/TopBar.jsx";
 import Login from "./pages/Login.jsx";
 import Signup from "./pages/Signup.jsx";
@@ -13,6 +14,9 @@ import Home from "./pages/Home.jsx";
 import Jobs from "./pages/Jobs.jsx";
 import Profile from "./pages/Profile.jsx";
 import FetchHistory from "./pages/FetchHistory.jsx";
+
+// Import ToastProvider for the app's toasts
+import { ToastProvider } from "./components/toast/ToastProvider";
 
 export default function App() {
   const [user, setUser] = useState(null);
@@ -52,22 +56,25 @@ export default function App() {
   }, [loading, user, mode, page, userMeta]);
 
   return (
-    <div className="h-full">
-      {user && <TopBar user={user} userMeta={userMeta} page={page} setPage={setPage} onLogout={() => signOut(auth)} />}
+    // Wrap the entire app with ToastProvider for global toast usage
+    <ToastProvider>
+      <div className="h-full">
+        {user && <TopBar user={user} userMeta={userMeta} page={page} setPage={setPage} onLogout={() => signOut(auth)} />}
 
-      {!user ? (
-        <div className="h-full">{content}</div>
-      ) : (
-        <main className="py-10">
-          <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
-            <AnimatePresence mode="wait">
-              <motion.div key={page} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.2 }}>
-                {content}
-              </motion.div>
-            </AnimatePresence>
-          </div>
-        </main>
-      )}
-    </div>
+        {!user ? (
+          <div className="h-full">{content}</div>
+        ) : (
+          <main className="py-10">
+            <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
+              <AnimatePresence mode="wait">
+                <motion.div key={page} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.2 }}>
+                  {content}
+                </motion.div>
+              </AnimatePresence>
+            </div>
+          </main>
+        )}
+      </div>
+    </ToastProvider> // Ensure this wraps your whole app
   );
 }

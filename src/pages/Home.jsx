@@ -203,8 +203,8 @@ export default function Home({ user }) {
 
         {/* ARCHIVED FEEDS */}
         <div className="bg-white shadow-sm ring-1 ring-gray-200 rounded-xl overflow-hidden">
-          <div className="px-6 py-4 border-b border-gray-100">
-            <h3 className="text-sm font-semibold text-gray-900">
+          <div className="px-6 py-4 border-b bg-indigo-50/60 border-indigo-100">
+            <h3 className="text-sm font-semibold text-indigo-900">
               Archived Feeds{" "}
               <span className="ml-1 text-gray-500 font-medium">
                 ({archivedFeeds.length})
