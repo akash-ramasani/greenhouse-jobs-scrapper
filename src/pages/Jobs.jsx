@@ -206,9 +206,6 @@ export default function Jobs({ user, userMeta }) {
     });
   }, [jobs, titleSearch, stateFilter, timeframe]);
 
-  // Updated Logic: Only show separate Bookmarks list if:
-  // 1. "All Companies" is selected (selectedKeys.length === 0)
-  // 2. Timeframe filter is "All Jobs" (timeframe === "all")
   const { bookmarkedJobs, regularJobs } = useMemo(() => {
     const showPinnedSeparately = selectedKeys.length === 0 && timeframe === "all";
 
@@ -254,13 +251,13 @@ export default function Jobs({ user, userMeta }) {
   return (
     <div className="py-8" style={{ fontFamily: "Ubuntu, sans-serif" }}>
       <div className="mb-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div>
+        <div className="text-center md:text-left">
           <h1 className="text-2xl font-bold text-gray-900 tracking-tight">Opportunities</h1>
           <p className="text-sm text-gray-500 mt-1">{selectedKeys.length === 0 ? "Viewing all companies" : `Filtering ${selectedKeys.length} source(s)`}</p>
         </div>
         
-        {/* Responsive Timeframe Toggle */}
-        <div className="flex overflow-hidden">
+        {/* Centered Horizontal Timeframe Toggle */}
+        <div className="flex justify-center w-full md:w-auto overflow-hidden">
           <div className="inline-flex p-1 bg-gray-100 rounded-xl overflow-x-auto no-scrollbar scroll-smooth">
             {['all', '24h', '12h', '6h', '1h'].map((id) => (
               <button 
