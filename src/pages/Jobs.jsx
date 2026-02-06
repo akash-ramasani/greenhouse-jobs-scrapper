@@ -124,7 +124,8 @@ export default function Jobs({ user, userMeta }) {
       console.error("Fetch jobs error:", err);
       showToast("Error loading jobs.", "error");
     } finally {
-      // Artificial delay to prevent UI pop-in while React filters results
+      // 150ms buffer ensures React has finished computing the filteredJobs useMemo
+      // before we remove the Skeleton loaders, preventing the "flicker"
       setTimeout(() => {
         setLoading(false);
         setIsProcessing(false);
@@ -179,6 +180,7 @@ export default function Jobs({ user, userMeta }) {
       if (titleTerm && !j.title?.toLowerCase().includes(titleTerm)) return false;
       if (stateFilter) {
         const location = (j.locationName || "").trim().toUpperCase();
+        // Regex ensures we match the state code correctly even in complex location strings
         const stateRegex = new RegExp(`(?:^|[^A-Z])${stateFilter}(?:$|[^A-Z])`);
         if (!stateRegex.test(location)) return false;
       }
