@@ -80,34 +80,6 @@ function shortAgoFromISO(iso) {
   return "Now";
 }
 
-// --- Dropdown Component ---
-function OptionsDropdown({ buttonLabel = "Options", children }) {
-  const [open, setOpen] = useState(false);
-  const rootRef = useRef(null);
-  useEffect(() => {
-    function onDocClick(e) { if (rootRef.current && !rootRef.current.contains(e.target)) setOpen(false); }
-    function onEsc(e) { if (e.key === "Escape") setOpen(false); }
-    document.addEventListener("mousedown", onDocClick);
-    document.addEventListener("keydown", onEsc);
-    return () => { document.removeEventListener("mousedown", onDocClick); document.removeEventListener("keydown", onEsc); };
-  }, []);
-  return (
-    <div ref={rootRef} className="relative inline-block">
-      <button type="button" onClick={() => setOpen((v) => !v)} className="inline-flex w-full justify-center gap-x-1.5 rounded-md bg-white px-3 py-2 text-sm font-semibold text-gray-900 shadow-sm ring-1 ring-inset ring-gray-300 hover:bg-gray-50 transition-all">
-        {buttonLabel}
-        <svg viewBox="0 0 20 20" fill="currentColor" className="-mr-1 size-5 text-gray-400">
-          <path d="M5.22 8.22a.75.75 0 0 1 1.06 0L10 11.94l3.72-3.72a.75.75 0 1 1 1.06 1.06l-4.25 4.25a.75.75 0 0 1-1.06 0L5.22 9.28a.75.75 0 0 1 0-1.06Z" clipRule="evenodd" fillRule="evenodd" />
-        </svg>
-      </button>
-      {open && (
-        <div className="absolute right-0 z-50 mt-2 w-80 origin-top-right rounded-md bg-white shadow-lg ring-1 ring-black ring-opacity-5 focus:outline-none">
-          <div className="py-2">{children}</div>
-        </div>
-      )}
-    </div>
-  );
-}
-
 export default function Jobs({ user, userMeta }) {
   const profileCountry = userMeta?.country || "United States";
   const { showToast } = useToast();
@@ -121,23 +93,23 @@ export default function Jobs({ user, userMeta }) {
   const [locationSearch, setLocationSearch] = useState("");
   const [stateFilter, setStateFilter] = useState("");
   const [stateInput, setStateInput] = useState("");
-  const [showRecentOnly, setShowRecentOnly] = useState(false);
+  const [timeframe, setTimeframe] = useState("all"); 
   const observer = useRef(null);
 
-  const RECENT_THRESHOLD_MS = 6 * 60 * 60 * 1000;
-
-  // 1. Fetch Companies
+  // 1. Load companies and auto-select the first one
   useEffect(() => {
     const companiesRef = collection(db, "users", user.uid, "companies");
     const qCompanies = query(companiesRef, orderBy("lastSeenAt", "desc"), limit(50));
     return onSnapshot(qCompanies, (snap) => {
       const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
       setCompanies(list);
-      if (!selectedCompanyKey && list.length) setSelectedCompanyKey(list[0].id);
+      if (!selectedCompanyKey && list.length) {
+        setSelectedCompanyKey(list[0].id);
+      }
     });
   }, [user.uid]);
 
-  // 2. Fetch Jobs
+  // 2. Fetch jobs for the selected company
   useEffect(() => {
     if (!selectedCompanyKey) return;
     setLoading(true); setJobs([]); setLastDoc(null); setHasMore(true);
@@ -152,7 +124,7 @@ export default function Jobs({ user, userMeta }) {
     }, () => setLoading(false));
   }, [user.uid, selectedCompanyKey]);
 
-  // 3. Infinite Scroll Fetch
+  // Infinite Scroll logic
   const fetchMore = async () => {
     if (!selectedCompanyKey || !lastDoc || loading) return;
     setLoading(true);
@@ -176,7 +148,6 @@ export default function Jobs({ user, userMeta }) {
     if (node) observer.current.observe(node);
   }, [loading, hasMore, lastDoc]);
 
-  // 4. Bookmark Toggle
   const toggleBookmark = async (e, job) => {
     e.preventDefault();
     const jobRef = doc(db, "users", user.uid, "companies", selectedCompanyKey, "jobs", job.id);
@@ -189,15 +160,15 @@ export default function Jobs({ user, userMeta }) {
     }
   };
 
-  // 5. Filter Logic
   const { bookmarkedJobs, regularJobs } = useMemo(() => {
     const locTerms = locationSearch.trim().toLowerCase();
     const now = Date.now();
-
     const filtered = jobs.filter((j) => {
-      if (showRecentOnly) {
+      if (timeframe !== "all") {
+        let hours = timeframe === "12h" ? 12 : timeframe === "6h" ? 6 : 24;
+        const thresholdMs = hours * 60 * 60 * 1000;
         const firstSeen = j.firstSeenAt?.toDate ? j.firstSeenAt.toDate().getTime() : 0;
-        if (now - firstSeen > RECENT_THRESHOLD_MS) return false;
+        if (now - firstSeen > thresholdMs) return false;
       }
       const location = (j.locationName || j.raw?.location?.name || "").trim();
       if (locTerms && !location.toLowerCase().includes(locTerms)) return false;
@@ -207,22 +178,20 @@ export default function Jobs({ user, userMeta }) {
       }
       return true;
     });
-
-    return {
-      bookmarkedJobs: filtered.filter(j => j.saved),
-      regularJobs: filtered.filter(j => !j.saved)
-    };
-  }, [jobs, locationSearch, stateFilter, profileCountry, showRecentOnly]);
+    return { bookmarkedJobs: filtered.filter(j => j.saved), regularJobs: filtered.filter(j => !j.saved) };
+  }, [jobs, locationSearch, stateFilter, profileCountry, timeframe]);
 
   const selectedCompany = useMemo(() => companies.find((c) => c.id === selectedCompanyKey) || null, [companies, selectedCompanyKey]);
 
-  // Shared Job Item Component logic inside render
   const renderJobItem = (job, ref = null) => (
-    <li key={job.id} ref={ref} className="group px-6 py-5 hover:bg-gray-50/80 transition-all border-l-4 border-transparent hover:border-indigo-500">
+    <li key={job.id} ref={ref} className="group relative px-6 py-5 hover:bg-gray-50/80 transition-all border-l-4 border-transparent hover:border-indigo-500">
+      <div className="absolute top-0 left-0 right-0 h-[1px] bg-indigo-500 opacity-0 group-hover:opacity-100 transition-opacity" />
       <div className="flex items-center justify-between">
         <a href={job.absolute_url || "#"} target="_blank" rel="noreferrer" className="min-w-0 flex-1">
           <div className="flex items-center gap-2 mb-1.5">
-            <span className="text-xs font-bold text-indigo-600 uppercase tracking-tight">{selectedCompany?.companyName || "Company"}</span>
+            <span className="text-xs font-bold text-indigo-600 uppercase tracking-tight">
+              {selectedCompany?.companyName || job.companyName || "Company"}
+            </span>
             <span className="text-gray-300">|</span>
             <span className="text-xs text-gray-500 font-medium truncate">{job.locationName || "Remote"}</span>
           </div>
@@ -244,76 +213,101 @@ export default function Jobs({ user, userMeta }) {
 
   return (
     <div className="py-8" style={{ fontFamily: "Ubuntu, sans-serif" }}>
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold text-gray-900 tracking-tight">Opportunities</h1>
-        <p className="text-sm text-gray-500 mt-1">
-          {selectedCompany ? <>Company: <span className="font-semibold">{selectedCompany.companyName}</span></> : "Select a company"}
-          <span className="text-gray-300"> • </span> {bookmarkedJobs.length + regularJobs.length} roles found
-        </p>
+      <div className="mb-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900 tracking-tight">Opportunities</h1>
+          <p className="text-sm text-gray-500 mt-1">
+            {selectedCompany ? <>Filtering: <span className="font-semibold text-indigo-600">{selectedCompany.companyName}</span></> : "Select a source below"}
+          </p>
+        </div>
+
+        {/* --- Segmented Timeframe Toggle --- */}
+        <div className="inline-flex p-1 bg-gray-100 rounded-xl overflow-x-auto max-w-full">
+          {[
+            { id: 'all', label: 'All Jobs' }, 
+            { id: '24h', label: 'Last 24h' }, 
+            { id: '12h', label: 'Last 12h' }, 
+            { id: '6h', label: 'Last 6h' }
+          ].map((option) => (
+            <button 
+              key={option.id} 
+              onClick={() => setTimeframe(option.id)} 
+              className={`px-4 py-1.5 text-[11px] font-bold rounded-lg transition-all whitespace-nowrap ${timeframe === option.id ? "bg-white text-indigo-600 shadow-sm" : "text-gray-500 hover:text-gray-700"}`}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
       </div>
 
-      {/* Controls Bar */}
-      <div className="space-y-4 mb-8">
+      <div className="space-y-6 mb-8">
         <div className="flex flex-wrap items-center gap-4 p-4 bg-white rounded-xl ring-1 ring-gray-200 shadow-sm">
           <div className="min-w-[240px] flex-1">
-            <label className="text-[11px] font-bold uppercase tracking-widest text-gray-400 mb-2 block">Company</label>
-            <select value={selectedCompanyKey || ""} onChange={(e) => setSelectedCompanyKey(e.target.value)} className="input-standard !bg-gray-50 border-transparent focus:!bg-white">
-              {companies.map((c) => <option key={c.id} value={c.id}>{c.companyName || c.id}</option>)}
-            </select>
+            <label className="text-[11px] font-bold uppercase tracking-widest text-gray-400 mb-2 block px-1">Location Search</label>
+            <input placeholder="e.g. San Francisco or Remote" className="input-standard !bg-gray-50 border-transparent focus:!bg-white" value={locationSearch} onChange={(e) => setLocationSearch(e.target.value)} />
           </div>
-          <div className="min-w-[240px] flex-1">
-            <label className="text-[11px] font-bold uppercase tracking-widest text-gray-400 mb-2 block">Location contains</label>
-            <input placeholder="e.g. San Francisco" className="input-standard !bg-gray-50 border-transparent focus:!bg-white" value={locationSearch} onChange={(e) => setLocationSearch(e.target.value)} />
+
+          <div className="w-full sm:w-auto">
+             <label className="text-[11px] font-bold uppercase tracking-widest text-gray-400 mb-2 block px-1">US State Filter</label>
+             <input list="us-states" value={stateInput} onChange={(e) => { setStateInput(e.target.value); const code = normalizeStateInputToCode(e.target.value); if(code || !e.target.value) setStateFilter(code); }} onBlur={() => { const code = normalizeStateInputToCode(stateInput); setStateFilter(code); setStateInput(stateCodeToLabel(code)); }} placeholder="Type State..." className="input-standard !bg-gray-50 border-transparent focus:!bg-white" />
+             <datalist id="us-states">{US_STATES.map((s) => <option key={s.code} value={`${s.code} - ${s.name}`} />)}</datalist>
           </div>
+          
           <div className="pt-6">
-            <button onClick={() => setShowRecentOnly(!showRecentOnly)} className={`inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold transition-all shadow-sm ring-1 ring-inset ${showRecentOnly ? "bg-indigo-600 text-white ring-indigo-600 hover:bg-indigo-700" : "bg-white text-gray-900 ring-gray-300 hover:bg-gray-50"}`}>
-              <svg className={`size-4 ${showRecentOnly ? "text-indigo-200" : "text-gray-400"}`} fill="none" viewBox="0 0 24 24" strokeWidth="2" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" /></svg>
-              {showRecentOnly ? "Latest (Past 12 Runs)" : "All History"}
-            </button>
+            <button onClick={() => { setLocationSearch(""); setStateFilter(""); setTimeframe("all"); }} className="text-xs font-bold text-gray-400 hover:text-indigo-600 transition-colors px-2">Reset</button>
           </div>
-          <div className="pt-6">
-            <OptionsDropdown buttonLabel="Filters">
-              <div className="px-4 py-2">
-                <div className="text-xs font-bold uppercase tracking-widest text-gray-400">Regional</div>
-                <div className="mt-3">
-                  <div className="text-sm font-semibold text-gray-900">US State</div>
-                  <input list="us-states" value={stateInput} onChange={(e) => { setStateInput(e.target.value); const code = normalizeStateInputToCode(e.target.value); if(code || !e.target.value) setStateFilter(code); }} onBlur={() => { const code = normalizeStateInputToCode(stateInput); setStateFilter(code); setStateInput(stateCodeToLabel(code)); }} placeholder="e.g. CA" className="input-standard mt-2 !bg-gray-50" />
-                  <datalist id="us-states">{US_STATES.map((s) => <option key={s.code} value={`${s.code} - ${s.name}`} />)}</datalist>
-                </div>
-                <button onClick={() => { setLocationSearch(""); setStateFilter(""); setShowRecentOnly(false); }} className="mt-4 w-full text-center text-sm font-semibold text-indigo-600 hover:text-indigo-700 pt-3 border-t border-gray-100">Clear All Filters</button>
-              </div>
-            </OptionsDropdown>
+        </div>
+
+        {/* Company Pills Section */}
+        <div className="space-y-3">
+          <div className="flex flex-wrap gap-2">
+            {companies.map((c) => {
+              const isSelected = selectedCompanyKey === c.id;
+              return (
+                <button
+                  key={c.id}
+                  onClick={() => !isSelected && setSelectedCompanyKey(c.id)}
+                  className={`inline-flex items-center gap-2 px-4 py-2 rounded-full text-xs font-bold transition-all border
+                    ${isSelected 
+                      ? "bg-indigo-600 border-indigo-600 text-white shadow-md shadow-indigo-100" 
+                      : "bg-white border-gray-200 text-gray-500 hover:border-gray-300 hover:bg-gray-50"
+                    }`}
+                >
+                  {c.companyName || c.id}
+                  {isSelected && (
+                    <svg viewBox="0 0 20 20" fill="currentColor" className="size-3.5 opacity-80">
+                      <path d="M6.28 5.22a.75.75 0 00-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 101.06 1.06L10 11.06l3.72 3.72a.75.75 0 1 1 1.06-1.06L11.06 10l3.72-3.72a.75.75 0 00-1.06-1.06L10 8.94 6.28 5.22z" />
+                    </svg>
+                  )}
+                </button>
+              );
+            })}
           </div>
         </div>
       </div>
 
       <div className="bg-white shadow-sm ring-1 ring-gray-200 rounded-2xl overflow-hidden">
-        {/* Bookmarked Section */}
         {bookmarkedJobs.length > 0 && (
           <>
-            <div className="bg-amber-50/50 px-6 py-3 border-b border-amber-100 flex items-center gap-2">
-              <svg className="size-4 text-amber-600" fill="currentColor" viewBox="0 0 20 20"><path d="M5 4a2 2 0 012-2h6a2 2 0 012 2v14l-5-2.5L5 18V4z" /></svg>
-              <span className="text-xs font-bold uppercase tracking-widest text-amber-700">Pinned for Review</span>
+            <div className="bg-amber-50/40 px-6 py-3 border-b border-amber-100/50 flex items-center gap-2">
+              <span className="text-[10px] font-black uppercase tracking-widest text-amber-700">📌 Pinned for Review</span>
             </div>
             <ul className="divide-y divide-gray-100">
               {bookmarkedJobs.map((job) => renderJobItem(job))}
             </ul>
             <div className="relative py-4 bg-white flex items-center px-6">
               <div className="flex-grow border-t border-dashed border-gray-200"></div>
-              <span className="flex-shrink mx-4 text-[10px] font-black uppercase tracking-[0.3em] text-gray-300">End of Pinned</span>
+              <span className="flex-shrink mx-4 text-[10px] font-black text-gray-300 uppercase tracking-widest">Recent Postings</span>
               <div className="flex-grow border-t border-dashed border-gray-200"></div>
             </div>
           </>
         )}
-
-        {/* Regular Section */}
         <ul className="divide-y divide-gray-100">
           {regularJobs.map((job, index) => renderJobItem(job, index === regularJobs.length - 1 ? lastElementRef : null))}
         </ul>
-
-        {loading && <div className="p-8 text-center text-xs text-gray-400 animate-pulse uppercase tracking-widest">Loading...</div>}
+        {loading && <div className="p-8 text-center text-xs text-gray-400 animate-pulse">Scanning...</div>}
         {!loading && bookmarkedJobs.length === 0 && regularJobs.length === 0 && (
-          <div className="p-10 text-center text-sm text-gray-500">No roles match your filters.</div>
+          <div className="p-10 text-center text-sm text-gray-500 italic">No roles found matching these filters.</div>
         )}
       </div>
     </div>
