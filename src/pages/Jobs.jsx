@@ -13,6 +13,7 @@ import {
   updateDoc,
   where,
 } from "firebase/firestore";
+import { AnimatePresence, motion } from "framer-motion";
 import { db } from "../firebase";
 import { useToast } from "../components/Toast/ToastProvider.jsx";
 
@@ -35,24 +36,8 @@ const US_STATES = [
   { code: "SC", name: "South Carolina" }, { code: "SD", name: "South Dakota" }, { code: "TN", name: "Tennessee" },
   { code: "TX", name: "Texas" }, { code: "UT", name: "Utah" }, { code: "VT", name: "Vermont" },
   { code: "VA", name: "Virginia" }, { code: "WA", name: "Washington" }, { code: "WV", name: "West Virginia" },
-  { code: "WI", name: "Wisconsin" }, { code: "WY", name: "Wyoming" }, { code: "DC", name: "District of Columbia" },
+  { code: "WI", name: "Wisconsin" }, { code: "WY", name: "Wyoming" }, { code: "DC", name: "DC" },
 ];
-
-function normalizeStateInputToCode(input) {
-  const raw = String(input || "").trim();
-  if (!raw) return "";
-  const upper = raw.toUpperCase();
-  const byCode = US_STATES.find((s) => s.code === upper);
-  if (byCode) return byCode.code;
-  const lower = raw.toLowerCase();
-  const byName = US_STATES.find((s) => s.name.toLowerCase() === lower);
-  return byName ? byName.code : "";
-}
-
-function stateCodeToLabel(code) {
-  const st = US_STATES.find((s) => s.code === code);
-  return st ? `${st.code} - ${st.name}` : code || "";
-}
 
 function timeAgoFromFirestore(ts) {
   if (!ts?.toDate) return "";
@@ -92,8 +77,8 @@ export default function Jobs({ user, userMeta }) {
   const [hasMore, setHasMore] = useState(true);
   const [titleSearch, setTitleSearch] = useState("");
   const [stateFilter, setStateFilter] = useState("");
-  const [stateInput, setStateInput] = useState("");
   const [timeframe, setTimeframe] = useState("all"); 
+  const [isFilterExpanded, setIsFilterExpanded] = useState(false);
   const observer = useRef(null);
 
   useEffect(() => {
@@ -249,14 +234,14 @@ export default function Jobs({ user, userMeta }) {
   );
 
   return (
-    <div className="py-8" style={{ fontFamily: "Ubuntu, sans-serif" }}>
+    <div className="py-8 px-4 md:px-0" style={{ fontFamily: "Ubuntu, sans-serif" }}>
+      {/* HEADER SECTION */}
       <div className="mb-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div className="text-center md:text-left">
           <h1 className="text-2xl font-bold text-gray-900 tracking-tight">Opportunities</h1>
           <p className="text-sm text-gray-500 mt-1">{selectedKeys.length === 0 ? "Viewing all companies" : `Filtering ${selectedKeys.length} source(s)`}</p>
         </div>
         
-        {/* Centered Horizontal Timeframe Toggle */}
         <div className="flex justify-center w-full md:w-auto overflow-hidden">
           <div className="inline-flex p-1 bg-gray-100 rounded-xl overflow-x-auto no-scrollbar scroll-smooth">
             {['all', '24h', '12h', '6h', '1h'].map((id) => (
@@ -274,29 +259,111 @@ export default function Jobs({ user, userMeta }) {
         </div>
       </div>
 
-      <div className="space-y-6 mb-8">
-        <div className="flex flex-wrap items-center gap-4 p-4 bg-white rounded-xl ring-1 ring-gray-200 shadow-sm">
-          <div className="min-w-[240px] flex-1">
-            <label className="caps-label mb-2 block px-1">Job Title Search</label>
-            <input placeholder="e.g. Software Engineer" className="input-standard !bg-gray-50 border-transparent focus:!bg-white" value={titleSearch} onChange={(e) => setTitleSearch(e.target.value)} />
+      {/* SEARCH BAR (With Centered Height Matching Button) */}
+      <div className="flex flex-wrap items-center gap-4 p-4 mb-6 bg-white rounded-xl ring-1 ring-gray-200 shadow-sm">
+        <div className="min-w-[240px] flex-1 flex items-end gap-3 h-fit">
+          <div className="flex-1">
+            <label className="caps-label mb-2 block px-1 text-gray-400">JOB TITLE SEARCH</label>
+            <input 
+              placeholder="e.g. Software Engineer" 
+              className="input-standard !bg-gray-50 border-transparent focus:!bg-white h-11" 
+              value={titleSearch} 
+              onChange={(e) => setTitleSearch(e.target.value)} 
+            />
           </div>
-          <div className="w-full sm:w-auto">
-             <label className="caps-label mb-2 block px-1">US State Filter</label>
-             <input list="us-states" value={stateInput} onChange={(e) => { setStateInput(e.target.value); const code = normalizeStateInputToCode(e.target.value); if(code || !e.target.value) setStateFilter(code); }} onBlur={() => { const code = normalizeStateInputToCode(stateInput); setStateFilter(code); setStateInput(stateCodeToLabel(code)); }} placeholder="Type State..." className="input-standard !bg-gray-50 border-transparent focus:!bg-white" />
-             <datalist id="us-states">{US_STATES.map((s) => <option key={s.code} value={`${s.code} - ${s.name}`} />)}</datalist>
-          </div>
-          <div className="pt-6">
-            <button onClick={() => { setTitleSearch(""); setStateFilter(""); setTimeframe("all"); setSelectedKeys([]); setStateInput(""); }} className="text-xs font-bold text-gray-400 hover:text-indigo-600 px-2">Reset All</button>
-          </div>
+          
+          <button 
+            onClick={() => setIsFilterExpanded(!isFilterExpanded)}
+            className={`h-11 w-11 flex items-center justify-center rounded-xl border transition-all ${
+              isFilterExpanded ? "bg-indigo-50 border-indigo-200 text-indigo-600" : "bg-white border-gray-200 text-gray-400 hover:bg-gray-50"
+            }`}
+          >
+            <svg viewBox="0 0 20 20" fill="currentColor" className="size-5 flex-none transition-transform duration-300">
+              <path d="M2.628 1.601C5.028 1.206 7.49 1 10 1s4.973.206 7.372.601a.75.75 0 0 1 .628.74v2.288a2.25 2.25 0 0 1-.659 1.59l-4.682 4.683a2.25 2.25 0 0 0-.659 1.59v3.037c0 .684-.31 1.33-.844 1.757l-1.937 1.55A.75.75 0 0 1 8 18.25v-5.757a2.25 2.25 0 0 0-.659-1.591L2.659 6.22A2.25 2.25 0 0 1 2 4.629V2.34a.75.75 0 0 1 .628-.74Z" clipRule="evenodd" fillRule="evenodd" />
+            </svg>
+          </button>
         </div>
 
-        <div className="flex flex-wrap gap-2">
-          <button onClick={() => setSelectedKeys([])} className={`px-4 py-2 rounded-full text-xs font-bold border transition-all ${selectedKeys.length === 0 ? "bg-indigo-600 text-white" : "bg-white text-gray-500"}`}>All Companies</button>
-          {companies.map((c) => (
-            <button key={c.id} onClick={() => toggleCompany(c.id)} className={`px-4 py-2 rounded-full text-xs font-bold border transition-all ${selectedKeys.includes(c.id) ? "bg-indigo-600 text-white" : "bg-white text-gray-500"}`}>{c.companyName}</button>
-          ))}
+        <div className="pt-6">
+          <button 
+            onClick={() => { setTitleSearch(""); setStateFilter(""); setTimeframe("all"); setSelectedKeys([]); }} 
+            className="text-xs font-bold text-gray-400 hover:text-indigo-600 px-2"
+          >
+            Reset All
+          </button>
         </div>
       </div>
+
+      <AnimatePresence>
+        {isFilterExpanded && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.3, ease: "easeInOut" }}
+            className="overflow-hidden mb-8"
+          >
+            <div className="space-y-8 py-4 px-1">
+              <div className="space-y-4">
+                <label className="caps-label px-1 text-gray-400">FILTER BY STATE</label>
+                <div className="flex w-full overflow-hidden">
+                  <div className="inline-flex p-1 bg-gray-50 rounded-xl overflow-x-auto no-scrollbar scroll-smooth gap-1">
+                    <button
+                      onClick={() => setStateFilter("")}
+                      className={`px-5 py-2.5 rounded-lg text-xs font-bold transition-all whitespace-nowrap ${
+                        stateFilter === "" ? "bg-white text-indigo-600 shadow-sm ring-1 ring-gray-200" : "text-gray-500 hover:text-gray-700"
+                      }`}
+                    >
+                      All States
+                    </button>
+                    {US_STATES.map((s) => (
+                      <button
+                        key={s.code}
+                        onClick={() => setStateFilter(s.code)}
+                        className={`px-5 py-2.5 rounded-lg text-xs font-bold transition-all whitespace-nowrap ${
+                          stateFilter === s.code ? "bg-indigo-600 text-white shadow-md shadow-indigo-100" : "bg-white text-gray-500 ring-1 ring-inset ring-gray-200 hover:bg-gray-50"
+                        }`}
+                      >
+                        {s.code} - {s.name}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-4">
+                <label className="caps-label px-1 text-gray-400">FILTER BY COMPANY</label>
+                <div className="flex w-full overflow-hidden">
+                  <div className="inline-flex p-1 bg-gray-50 rounded-xl overflow-x-auto no-scrollbar scroll-smooth gap-1">
+                    <button
+                      onClick={() => setSelectedKeys([])}
+                      className={`px-5 py-2.5 rounded-lg text-xs font-bold transition-all whitespace-nowrap ${
+                        selectedKeys.length === 0 ? "bg-white text-indigo-600 shadow-sm ring-1 ring-gray-200" : "text-gray-500 hover:text-gray-700"
+                      }`}
+                    >
+                      All Companies
+                    </button>
+                    {companies.map((c) => {
+                      const isSelected = selectedKeys.includes(c.id);
+                      return (
+                        <button
+                          key={c.id}
+                          onClick={() => toggleCompany(c.id)}
+                          className={`px-5 py-2.5 rounded-lg text-xs font-bold transition-all whitespace-nowrap ${
+                            isSelected ? "bg-indigo-600 text-white shadow-md shadow-indigo-100" : "bg-white text-gray-500 ring-1 ring-inset ring-gray-200 hover:bg-gray-50"
+                          }`}
+                        >
+                          {c.companyName || c.id}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <div className="bg-white shadow-sm ring-1 ring-gray-200 rounded-2xl overflow-hidden pb-4">
         {bookmarkedJobs.length > 0 && (
