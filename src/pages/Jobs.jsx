@@ -2,6 +2,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   collection,
+  collectionGroup,
   doc,
   getDocs,
   limit,
@@ -10,13 +11,13 @@ import {
   query,
   startAfter,
   updateDoc,
+  where,
 } from "firebase/firestore";
 import { db } from "../firebase";
 import { useToast } from "../components/Toast/ToastProvider.jsx";
 
-const PAGE_SIZE = 100;
+const PAGE_SIZE = 50;
 
-// --- Helper Data & Formatters ---
 const US_STATES = [
   { code: "AL", name: "Alabama" }, { code: "AK", name: "Alaska" }, { code: "AZ", name: "Arizona" },
   { code: "AR", name: "Arkansas" }, { code: "CA", name: "California" }, { code: "CO", name: "Colorado" },
@@ -85,7 +86,7 @@ export default function Jobs({ user, userMeta }) {
   const { showToast } = useToast();
 
   const [companies, setCompanies] = useState([]);
-  const [selectedCompanyKey, setSelectedCompanyKey] = useState(null);
+  const [selectedKeys, setSelectedKeys] = useState([]);
   const [jobs, setJobs] = useState([]);
   const [loading, setLoading] = useState(false);
   const [lastDoc, setLastDoc] = useState(null);
@@ -96,66 +97,81 @@ export default function Jobs({ user, userMeta }) {
   const [timeframe, setTimeframe] = useState("all"); 
   const observer = useRef(null);
 
-  // 1. Load companies and auto-select the first one
   useEffect(() => {
     const companiesRef = collection(db, "users", user.uid, "companies");
-    const qCompanies = query(companiesRef, orderBy("lastSeenAt", "desc"), limit(50));
+    const qCompanies = query(companiesRef, orderBy("lastSeenAt", "desc"), limit(100));
     return onSnapshot(qCompanies, (snap) => {
-      const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-      setCompanies(list);
-      if (!selectedCompanyKey && list.length) {
-        setSelectedCompanyKey(list[0].id);
-      }
+      setCompanies(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
     });
   }, [user.uid]);
 
-  // 2. Fetch jobs for the selected company
-  useEffect(() => {
-    if (!selectedCompanyKey) return;
-    setLoading(true); setJobs([]); setLastDoc(null); setHasMore(true);
-    const jobsRef = collection(db, "users", user.uid, "companies", selectedCompanyKey, "jobs");
-    const qJobs = query(jobsRef, orderBy("updatedAtIso", "desc"), limit(PAGE_SIZE));
-    return onSnapshot(qJobs, (snap) => {
-      const docs = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-      setJobs(docs);
-      setLastDoc(snap.docs[snap.docs.length - 1] || null);
-      setHasMore(snap.docs.length === PAGE_SIZE);
-      setLoading(false);
-    }, () => setLoading(false));
-  }, [user.uid, selectedCompanyKey]);
-
-  // Infinite Scroll logic
-  const fetchMore = async () => {
-    if (!selectedCompanyKey || !lastDoc || loading) return;
+  const fetchJobs = useCallback(async (isFirstPage = true) => {
+    if (loading) return;
     setLoading(true);
+
     try {
-      const jobsRef = collection(db, "users", user.uid, "companies", selectedCompanyKey, "jobs");
-      const nextQ = query(jobsRef, orderBy("updatedAtIso", "desc"), startAfter(lastDoc), limit(PAGE_SIZE));
-      const snap = await getDocs(nextQ);
-      const nextJobs = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-      setJobs((prev) => [...prev, ...nextJobs]);
+      const jobsQueryBase = collectionGroup(db, "jobs");
+      let constraints = [
+        where("uid", "==", user.uid),
+        orderBy("updatedAtIso", "desc"),
+        limit(PAGE_SIZE)
+      ];
+
+      if (selectedKeys.length > 0) {
+        constraints.unshift(where("companyKey", "in", selectedKeys));
+      }
+
+      if (!isFirstPage && lastDoc) {
+        constraints.push(startAfter(lastDoc));
+      }
+
+      const qJobs = query(jobsQueryBase, ...constraints);
+      const snap = await getDocs(qJobs);
+      const docs = snap.docs.map((d) => ({ 
+        id: d.id, 
+        ...d.data(), 
+        _path: d.ref.path // Store the path for bookmark updates
+      }));
+
+      setJobs(prev => isFirstPage ? docs : [...prev, ...docs]);
       setLastDoc(snap.docs[snap.docs.length - 1] || null);
       setHasMore(snap.docs.length === PAGE_SIZE);
-    } finally { setLoading(false); }
+    } catch (err) {
+      console.error("Fetch jobs error:", err);
+      showToast("Permission or Index error. See console.", "error");
+    } finally {
+      setLoading(false);
+    }
+  }, [user.uid, selectedKeys, lastDoc, loading, showToast]);
+
+  useEffect(() => {
+    setLastDoc(null);
+    setJobs([]);
+    fetchJobs(true);
+  }, [selectedKeys]);
+
+  const toggleCompany = (key) => {
+    setSelectedKeys(prev => prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key]);
   };
 
   const lastElementRef = useCallback((node) => {
     if (loading) return;
     if (observer.current) observer.current.disconnect();
     observer.current = new IntersectionObserver((entries) => {
-      if (entries[0].isIntersecting && hasMore) fetchMore();
+      if (entries[0].isIntersecting && hasMore) fetchJobs(false);
     });
     if (node) observer.current.observe(node);
-  }, [loading, hasMore, lastDoc]);
+  }, [loading, hasMore, fetchJobs]);
 
   const toggleBookmark = async (e, job) => {
     e.preventDefault();
-    const jobRef = doc(db, "users", user.uid, "companies", selectedCompanyKey, "jobs", job.id);
+    const newState = !job.saved;
+    setJobs(prev => prev.map(j => j.id === job.id ? { ...j, saved: newState } : j));
     try {
-      const newState = !job.saved;
-      await updateDoc(jobRef, { saved: newState });
+      await updateDoc(doc(db, job._path), { saved: newState });
       showToast(newState ? "Job pinned" : "Pin removed", "info");
     } catch (err) {
+      setJobs(prev => prev.map(j => j.id === job.id ? { ...j, saved: !newState } : j));
       showToast("Error updating bookmark", "error");
     }
   };
@@ -181,17 +197,13 @@ export default function Jobs({ user, userMeta }) {
     return { bookmarkedJobs: filtered.filter(j => j.saved), regularJobs: filtered.filter(j => !j.saved) };
   }, [jobs, locationSearch, stateFilter, profileCountry, timeframe]);
 
-  const selectedCompany = useMemo(() => companies.find((c) => c.id === selectedCompanyKey) || null, [companies, selectedCompanyKey]);
-
   const renderJobItem = (job, ref = null) => (
     <li key={job.id} ref={ref} className="group relative px-6 py-5 hover:bg-gray-50/80 transition-all border-l-4 border-transparent hover:border-indigo-500">
       <div className="absolute top-0 left-0 right-0 h-[1px] bg-indigo-500 opacity-0 group-hover:opacity-100 transition-opacity" />
       <div className="flex items-center justify-between">
         <a href={job.absolute_url || "#"} target="_blank" rel="noreferrer" className="min-w-0 flex-1">
           <div className="flex items-center gap-2 mb-1.5">
-            <span className="text-xs font-bold text-indigo-600 uppercase tracking-tight">
-              {selectedCompany?.companyName || job.companyName || "Company"}
-            </span>
+            <span className="text-xs font-bold text-indigo-600 uppercase tracking-tight">{job.companyName}</span>
             <span className="text-gray-300">|</span>
             <span className="text-xs text-gray-500 font-medium truncate">{job.locationName || "Remote"}</span>
           </div>
@@ -216,25 +228,12 @@ export default function Jobs({ user, userMeta }) {
       <div className="mb-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-gray-900 tracking-tight">Opportunities</h1>
-          <p className="text-sm text-gray-500 mt-1">
-            {selectedCompany ? <>Filtering: <span className="font-semibold text-indigo-600">{selectedCompany.companyName}</span></> : "Select a source below"}
-          </p>
+          <p className="text-sm text-gray-500 mt-1">{selectedKeys.length === 0 ? "Viewing all companies" : `Filtering ${selectedKeys.length} source(s)`}</p>
         </div>
-
-        {/* --- Segmented Timeframe Toggle --- */}
         <div className="inline-flex p-1 bg-gray-100 rounded-xl overflow-x-auto max-w-full">
-          {[
-            { id: 'all', label: 'All Jobs' }, 
-            { id: '24h', label: 'Last 24h' }, 
-            { id: '12h', label: 'Last 12h' }, 
-            { id: '6h', label: 'Last 6h' }
-          ].map((option) => (
-            <button 
-              key={option.id} 
-              onClick={() => setTimeframe(option.id)} 
-              className={`px-4 py-1.5 text-[11px] font-bold rounded-lg transition-all whitespace-nowrap ${timeframe === option.id ? "bg-white text-indigo-600 shadow-sm" : "text-gray-500 hover:text-gray-700"}`}
-            >
-              {option.label}
+          {['all', '24h', '12h', '6h'].map((id) => (
+            <button key={id} onClick={() => setTimeframe(id)} className={`px-4 py-1.5 text-[11px] font-bold rounded-lg transition-all whitespace-nowrap ${timeframe === id ? "bg-white text-indigo-600 shadow-sm" : "text-gray-500 hover:text-gray-700"}`}>
+              {id === 'all' ? 'All Jobs' : `Last ${id}`}
             </button>
           ))}
         </div>
@@ -243,46 +242,24 @@ export default function Jobs({ user, userMeta }) {
       <div className="space-y-6 mb-8">
         <div className="flex flex-wrap items-center gap-4 p-4 bg-white rounded-xl ring-1 ring-gray-200 shadow-sm">
           <div className="min-w-[240px] flex-1">
-            <label className="text-[11px] font-bold uppercase tracking-widest text-gray-400 mb-2 block px-1">Location Search</label>
+            <label className="caps-label mb-2 block px-1">Location Search</label>
             <input placeholder="e.g. San Francisco or Remote" className="input-standard !bg-gray-50 border-transparent focus:!bg-white" value={locationSearch} onChange={(e) => setLocationSearch(e.target.value)} />
           </div>
-
           <div className="w-full sm:w-auto">
-             <label className="text-[11px] font-bold uppercase tracking-widest text-gray-400 mb-2 block px-1">US State Filter</label>
+             <label className="caps-label mb-2 block px-1">US State Filter</label>
              <input list="us-states" value={stateInput} onChange={(e) => { setStateInput(e.target.value); const code = normalizeStateInputToCode(e.target.value); if(code || !e.target.value) setStateFilter(code); }} onBlur={() => { const code = normalizeStateInputToCode(stateInput); setStateFilter(code); setStateInput(stateCodeToLabel(code)); }} placeholder="Type State..." className="input-standard !bg-gray-50 border-transparent focus:!bg-white" />
              <datalist id="us-states">{US_STATES.map((s) => <option key={s.code} value={`${s.code} - ${s.name}`} />)}</datalist>
           </div>
-          
           <div className="pt-6">
-            <button onClick={() => { setLocationSearch(""); setStateFilter(""); setTimeframe("all"); }} className="text-xs font-bold text-gray-400 hover:text-indigo-600 transition-colors px-2">Reset</button>
+            <button onClick={() => { setLocationSearch(""); setStateFilter(""); setTimeframe("all"); setSelectedKeys([]); setStateInput(""); }} className="text-xs font-bold text-gray-400 hover:text-indigo-600 px-2">Reset All</button>
           </div>
         </div>
 
-        {/* Company Pills Section */}
-        <div className="space-y-3">
-          <div className="flex flex-wrap gap-2">
-            {companies.map((c) => {
-              const isSelected = selectedCompanyKey === c.id;
-              return (
-                <button
-                  key={c.id}
-                  onClick={() => !isSelected && setSelectedCompanyKey(c.id)}
-                  className={`inline-flex items-center gap-2 px-4 py-2 rounded-full text-xs font-bold transition-all border
-                    ${isSelected 
-                      ? "bg-indigo-600 border-indigo-600 text-white shadow-md shadow-indigo-100" 
-                      : "bg-white border-gray-200 text-gray-500 hover:border-gray-300 hover:bg-gray-50"
-                    }`}
-                >
-                  {c.companyName || c.id}
-                  {isSelected && (
-                    <svg viewBox="0 0 20 20" fill="currentColor" className="size-3.5 opacity-80">
-                      <path d="M6.28 5.22a.75.75 0 00-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 101.06 1.06L10 11.06l3.72 3.72a.75.75 0 1 1 1.06-1.06L11.06 10l3.72-3.72a.75.75 0 00-1.06-1.06L10 8.94 6.28 5.22z" />
-                    </svg>
-                  )}
-                </button>
-              );
-            })}
-          </div>
+        <div className="flex flex-wrap gap-2">
+          <button onClick={() => setSelectedKeys([])} className={`px-4 py-2 rounded-full text-xs font-bold border transition-all ${selectedKeys.length === 0 ? "bg-indigo-600 text-white" : "bg-white text-gray-500"}`}>All Companies</button>
+          {companies.map((c) => (
+            <button key={c.id} onClick={() => toggleCompany(c.id)} className={`px-4 py-2 rounded-full text-xs font-bold border transition-all ${selectedKeys.includes(c.id) ? "bg-indigo-600 text-white" : "bg-white text-gray-500"}`}>{c.companyName}</button>
+          ))}
         </div>
       </div>
 
@@ -292,9 +269,7 @@ export default function Jobs({ user, userMeta }) {
             <div className="bg-amber-50/40 px-6 py-3 border-b border-amber-100/50 flex items-center gap-2">
               <span className="text-[10px] font-black uppercase tracking-widest text-amber-700">📌 Pinned for Review</span>
             </div>
-            <ul className="divide-y divide-gray-100">
-              {bookmarkedJobs.map((job) => renderJobItem(job))}
-            </ul>
+            <ul className="divide-y divide-gray-100">{bookmarkedJobs.map((job) => renderJobItem(job))}</ul>
             <div className="relative py-4 bg-white flex items-center px-6">
               <div className="flex-grow border-t border-dashed border-gray-200"></div>
               <span className="flex-shrink mx-4 text-[10px] font-black text-gray-300 uppercase tracking-widest">Recent Postings</span>
@@ -302,13 +277,9 @@ export default function Jobs({ user, userMeta }) {
             </div>
           </>
         )}
-        <ul className="divide-y divide-gray-100">
-          {regularJobs.map((job, index) => renderJobItem(job, index === regularJobs.length - 1 ? lastElementRef : null))}
-        </ul>
+        <ul className="divide-y divide-gray-100">{regularJobs.map((job, index) => renderJobItem(job, index === regularJobs.length - 1 ? lastElementRef : null))}</ul>
         {loading && <div className="p-8 text-center text-xs text-gray-400 animate-pulse">Scanning...</div>}
-        {!loading && bookmarkedJobs.length === 0 && regularJobs.length === 0 && (
-          <div className="p-10 text-center text-sm text-gray-500 italic">No roles found matching these filters.</div>
-        )}
+        {!loading && jobs.length === 0 && <div className="p-10 text-center text-sm text-gray-500 italic">No roles found.</div>}
       </div>
     </div>
   );
