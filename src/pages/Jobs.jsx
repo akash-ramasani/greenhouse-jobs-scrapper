@@ -82,7 +82,6 @@ function shortAgoFromISO(iso) {
 }
 
 export default function Jobs({ user, userMeta }) {
-  const profileCountry = userMeta?.country || "United States";
   const { showToast } = useToast();
 
   const [companies, setCompanies] = useState([]);
@@ -91,7 +90,7 @@ export default function Jobs({ user, userMeta }) {
   const [loading, setLoading] = useState(false);
   const [lastDoc, setLastDoc] = useState(null);
   const [hasMore, setHasMore] = useState(true);
-  const [locationSearch, setLocationSearch] = useState("");
+  const [titleSearch, setTitleSearch] = useState("");
   const [stateFilter, setStateFilter] = useState("");
   const [stateInput, setStateInput] = useState("");
   const [timeframe, setTimeframe] = useState("all"); 
@@ -130,7 +129,7 @@ export default function Jobs({ user, userMeta }) {
       const docs = snap.docs.map((d) => ({ 
         id: d.id, 
         ...d.data(), 
-        _path: d.ref.path // Store the path for bookmark updates
+        _path: d.ref.path 
       }));
 
       setJobs(prev => isFirstPage ? docs : [...prev, ...docs]);
@@ -138,7 +137,7 @@ export default function Jobs({ user, userMeta }) {
       setHasMore(snap.docs.length === PAGE_SIZE);
     } catch (err) {
       console.error("Fetch jobs error:", err);
-      showToast("Permission or Index error. See console.", "error");
+      showToast("Error loading jobs.", "error");
     } finally {
       setLoading(false);
     }
@@ -150,18 +149,25 @@ export default function Jobs({ user, userMeta }) {
     fetchJobs(true);
   }, [selectedKeys]);
 
+  const lastElementRef = useCallback((node) => {
+    if (loading || !hasMore) return;
+    if (observer.current) observer.current.disconnect();
+
+    observer.current = new IntersectionObserver((entries) => {
+      if (entries[0].isIntersecting && hasMore && !loading) {
+        fetchJobs(false);
+      }
+    }, { 
+      rootMargin: '400px', 
+      threshold: 0 
+    });
+
+    if (node) observer.current.observe(node);
+  }, [loading, hasMore, fetchJobs]);
+
   const toggleCompany = (key) => {
     setSelectedKeys(prev => prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key]);
   };
-
-  const lastElementRef = useCallback((node) => {
-    if (loading) return;
-    if (observer.current) observer.current.disconnect();
-    observer.current = new IntersectionObserver((entries) => {
-      if (entries[0].isIntersecting && hasMore) fetchJobs(false);
-    });
-    if (node) observer.current.observe(node);
-  }, [loading, hasMore, fetchJobs]);
 
   const toggleBookmark = async (e, job) => {
     e.preventDefault();
@@ -176,29 +182,51 @@ export default function Jobs({ user, userMeta }) {
     }
   };
 
-  const { bookmarkedJobs, regularJobs } = useMemo(() => {
-    const locTerms = locationSearch.trim().toLowerCase();
+  const filteredJobs = useMemo(() => {
+    const titleTerm = titleSearch.trim().toLowerCase();
     const now = Date.now();
-    const filtered = jobs.filter((j) => {
+    
+    return jobs.filter((j) => {
       if (timeframe !== "all") {
-        let hours = timeframe === "12h" ? 12 : timeframe === "6h" ? 6 : 24;
-        const thresholdMs = hours * 60 * 60 * 1000;
+        const hoursMap = { '24h': 24, '12h': 12, '6h': 6, '1h': 1 };
+        const thresholdMs = hoursMap[timeframe] * 60 * 60 * 1000;
         const firstSeen = j.firstSeenAt?.toDate ? j.firstSeenAt.toDate().getTime() : 0;
         if (now - firstSeen > thresholdMs) return false;
       }
-      const location = (j.locationName || j.raw?.location?.name || "").trim();
-      if (locTerms && !location.toLowerCase().includes(locTerms)) return false;
-      if (profileCountry === "United States" && stateFilter) {
-        const re = new RegExp(`(?:^|[\\s,•|/()\\-])${stateFilter}(?=$|[\\s,•|/()\\-])`);
-        if (!re.test(location)) return false;
+
+      if (titleTerm && !j.title?.toLowerCase().includes(titleTerm)) return false;
+
+      if (stateFilter) {
+        const location = (j.locationName || "").trim().toUpperCase();
+        const stateRegex = new RegExp(`(?:^|[^A-Z])${stateFilter}(?:$|[^A-Z])`);
+        if (!stateRegex.test(location)) return false;
       }
+
       return true;
     });
-    return { bookmarkedJobs: filtered.filter(j => j.saved), regularJobs: filtered.filter(j => !j.saved) };
-  }, [jobs, locationSearch, stateFilter, profileCountry, timeframe]);
+  }, [jobs, titleSearch, stateFilter, timeframe]);
 
-  const renderJobItem = (job, ref = null) => (
-    <li key={job.id} ref={ref} className="group relative px-6 py-5 hover:bg-gray-50/80 transition-all border-l-4 border-transparent hover:border-indigo-500">
+  // Updated Logic: Only show separate Bookmarks list if:
+  // 1. "All Companies" is selected (selectedKeys.length === 0)
+  // 2. Timeframe filter is "All Jobs" (timeframe === "all")
+  const { bookmarkedJobs, regularJobs } = useMemo(() => {
+    const showPinnedSeparately = selectedKeys.length === 0 && timeframe === "all";
+
+    if (showPinnedSeparately) {
+      return {
+        bookmarkedJobs: filteredJobs.filter(j => j.saved),
+        regularJobs: filteredJobs.filter(j => !j.saved)
+      };
+    } else {
+      return {
+        bookmarkedJobs: [],
+        regularJobs: filteredJobs
+      };
+    }
+  }, [filteredJobs, selectedKeys, timeframe]);
+
+  const renderJobItem = (job) => (
+    <li key={job.id} className="group relative px-6 py-5 hover:bg-gray-50/80 transition-all border-l-4 border-transparent hover:border-indigo-500">
       <div className="absolute top-0 left-0 right-0 h-[1px] bg-indigo-500 opacity-0 group-hover:opacity-100 transition-opacity" />
       <div className="flex items-center justify-between">
         <a href={job.absolute_url || "#"} target="_blank" rel="noreferrer" className="min-w-0 flex-1">
@@ -230,20 +258,30 @@ export default function Jobs({ user, userMeta }) {
           <h1 className="text-2xl font-bold text-gray-900 tracking-tight">Opportunities</h1>
           <p className="text-sm text-gray-500 mt-1">{selectedKeys.length === 0 ? "Viewing all companies" : `Filtering ${selectedKeys.length} source(s)`}</p>
         </div>
-        <div className="inline-flex p-1 bg-gray-100 rounded-xl overflow-x-auto max-w-full">
-          {['all', '24h', '12h', '6h'].map((id) => (
-            <button key={id} onClick={() => setTimeframe(id)} className={`px-4 py-1.5 text-[11px] font-bold rounded-lg transition-all whitespace-nowrap ${timeframe === id ? "bg-white text-indigo-600 shadow-sm" : "text-gray-500 hover:text-gray-700"}`}>
-              {id === 'all' ? 'All Jobs' : `Last ${id}`}
-            </button>
-          ))}
+        
+        {/* Responsive Timeframe Toggle */}
+        <div className="flex overflow-hidden">
+          <div className="inline-flex p-1 bg-gray-100 rounded-xl overflow-x-auto no-scrollbar scroll-smooth">
+            {['all', '24h', '12h', '6h', '1h'].map((id) => (
+              <button 
+                key={id} 
+                onClick={() => setTimeframe(id)} 
+                className={`px-4 py-1.5 text-[11px] font-bold rounded-lg transition-all whitespace-nowrap min-w-fit ${
+                  timeframe === id ? "bg-white text-indigo-600 shadow-sm" : "text-gray-500 hover:text-gray-700"
+                }`}
+              >
+                {id === 'all' ? 'All Jobs' : `Last ${id}`}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
       <div className="space-y-6 mb-8">
         <div className="flex flex-wrap items-center gap-4 p-4 bg-white rounded-xl ring-1 ring-gray-200 shadow-sm">
           <div className="min-w-[240px] flex-1">
-            <label className="caps-label mb-2 block px-1">Location Search</label>
-            <input placeholder="e.g. San Francisco or Remote" className="input-standard !bg-gray-50 border-transparent focus:!bg-white" value={locationSearch} onChange={(e) => setLocationSearch(e.target.value)} />
+            <label className="caps-label mb-2 block px-1">Job Title Search</label>
+            <input placeholder="e.g. Software Engineer" className="input-standard !bg-gray-50 border-transparent focus:!bg-white" value={titleSearch} onChange={(e) => setTitleSearch(e.target.value)} />
           </div>
           <div className="w-full sm:w-auto">
              <label className="caps-label mb-2 block px-1">US State Filter</label>
@@ -251,7 +289,7 @@ export default function Jobs({ user, userMeta }) {
              <datalist id="us-states">{US_STATES.map((s) => <option key={s.code} value={`${s.code} - ${s.name}`} />)}</datalist>
           </div>
           <div className="pt-6">
-            <button onClick={() => { setLocationSearch(""); setStateFilter(""); setTimeframe("all"); setSelectedKeys([]); setStateInput(""); }} className="text-xs font-bold text-gray-400 hover:text-indigo-600 px-2">Reset All</button>
+            <button onClick={() => { setTitleSearch(""); setStateFilter(""); setTimeframe("all"); setSelectedKeys([]); setStateInput(""); }} className="text-xs font-bold text-gray-400 hover:text-indigo-600 px-2">Reset All</button>
           </div>
         </div>
 
@@ -263,7 +301,7 @@ export default function Jobs({ user, userMeta }) {
         </div>
       </div>
 
-      <div className="bg-white shadow-sm ring-1 ring-gray-200 rounded-2xl overflow-hidden">
+      <div className="bg-white shadow-sm ring-1 ring-gray-200 rounded-2xl overflow-hidden pb-4">
         {bookmarkedJobs.length > 0 && (
           <>
             <div className="bg-amber-50/40 px-6 py-3 border-b border-amber-100/50 flex items-center gap-2">
@@ -277,9 +315,26 @@ export default function Jobs({ user, userMeta }) {
             </div>
           </>
         )}
-        <ul className="divide-y divide-gray-100">{regularJobs.map((job, index) => renderJobItem(job, index === regularJobs.length - 1 ? lastElementRef : null))}</ul>
-        {loading && <div className="p-8 text-center text-xs text-gray-400 animate-pulse">Scanning...</div>}
-        {!loading && jobs.length === 0 && <div className="p-10 text-center text-sm text-gray-500 italic">No roles found.</div>}
+        
+        <ul className="divide-y divide-gray-100">
+          {regularJobs.map((job) => renderJobItem(job))}
+        </ul>
+
+        <div ref={lastElementRef} className="h-10 w-full flex items-center justify-center">
+            {loading && hasMore && (
+                <span className="text-[10px] font-black text-gray-300 uppercase tracking-widest animate-pulse">Scanning...</span>
+            )}
+        </div>
+        
+        {!loading && filteredJobs.length === 0 && (
+          <div className="p-10 text-center text-sm text-gray-500 italic">No roles found matching these filters.</div>
+        )}
+        
+        {!hasMore && filteredJobs.length > 0 && (
+          <div className="p-4 text-center border-t border-gray-50 mt-4">
+             <span className="text-[10px] font-black text-gray-200 uppercase tracking-widest">End of Feed</span>
+          </div>
+        )}
       </div>
     </div>
   );
