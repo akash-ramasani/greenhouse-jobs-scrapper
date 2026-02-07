@@ -1,7 +1,7 @@
 /**
  * functions/index.js
  * Node runtime: 20
- * Optimized: US-Filter (States + Cities) + Robust History Logging
+ * Optimized: US-Filter + Robust History Logging + Scheduler Pause Logic
  */
 
 const functions = require("firebase-functions");
@@ -12,65 +12,37 @@ const db = admin.firestore();
 
 // --- Robust US Location Filtering ---
 const US_STATE_CODES = ["AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY", "DC"];
-
 const US_KEYWORDS = ["UNITED STATES", "USA", "AMER - US", "USCA", "US-REMOTE", "US REMOTE", "REMOTE US", "REMOTE - US", "NYC", "SAN FRANCISCO", "SF-HQ", "US-NATIONAL", "WASHINGTON DC", "ANYWHERE IN THE UNITED STATES"];
-
-const MAJOR_US_CITIES = [
-  "SAN FRANCISCO", "NYC", "NEW YORK CITY", "LOS ANGELES", "CHICAGO", "HOUSTON", 
-  "PHOENIX", "PHILADELPHIA", "SAN ANTONIO", "SAN DIEGO", "DALLAS", "SAN JOSE", 
-  "AUSTIN", "JACKSONVILLE", "FORT WORTH", "COLUMBUS", "CHARLOTTE", "INDIANAPOLIS", 
-  "SEATTLE", "DENVER", "BOSTON", "EL PASO", "NASHVILLE", "DETROIT", 
-  "OKLAHOMA CITY", "PORTLAND", "LAS VEGAS", "MEMPHIS", "LOUISVILLE", "BALTIMORE", 
-  "MILWAUKEE", "ALBUQUERQUE", "TUCSON", "FRESNO", "SACRAMENTO", "MESA", "KANSAS CITY", 
-  "ATLANTA", "OMAHA", "COLORADO SPRINGS", "RALEIGH", "LONG BEACH", "VIRGINIA BEACH", 
-  "MIAMI", "OAKLAND", "MINNEAPOLIS", "TULSA", "BAKERSFIELD", "WICHITA", "ARLINGTON"
-];
+const MAJOR_US_CITIES = ["SAN FRANCISCO", "NYC", "NEW YORK CITY", "LOS ANGELES", "CHICAGO", "HOUSTON", "PHOENIX", "PHILADELPHIA", "SAN ANTONIO", "SAN DIEGO", "DALLAS", "SAN JOSE", "AUSTIN", "JACKSONVILLE", "FORT WORTH", "COLUMBUS", "CHARLOTTE", "INDIANAPOLIS", "SEATTLE", "DENVER", "BOSTON", "EL PASO", "NASHVILLE", "DETROIT", "OKLAHOMA CITY", "PORTLAND", "LAS VEGAS", "MEMPHIS", "LOUISVILLE", "BALTIMORE", "MILWAUKEE", "ALBUQUERQUE", "TUCSON", "FRESNO", "SACRAMENTO", "MESA", "KANSAS CITY", "ATLANTA", "OMAHA", "COLORADO SPRINGS", "RALEIGH", "LONG BEACH", "VIRGINIA BEACH", "MIAMI", "OAKLAND", "MINNEAPOLIS", "TULSA", "BAKERSFIELD", "WICHITA", "ARLINGTON"];
 
 function isUSLocation(locationText) {
   if (!locationText) return false;
   const text = locationText.toUpperCase();
-
-  // 1. Check Keywords
   if (US_KEYWORDS.some(kw => text.includes(kw))) return true;
-
-  // 2. Check Major Cities with Word Boundaries
-  if (MAJOR_US_CITIES.some(city => {
-    const regex = new RegExp(`(?:^|[,\\s\\/])${city}(?:[\\s,;\\/]|$)`);
-    return regex.test(text);
-  })) return true;
-
-  // 3. Check State Codes
-  const stateMatch = US_STATE_CODES.some(code => {
-    const regex = new RegExp(`(?:^|[,\\s\\/])${code}(?:[\\s,;\\/]|$)`);
-    return regex.test(text);
-  });
-  
-  return stateMatch || /\bUS\b/.test(text) || text.includes("U.S.");
+  if (MAJOR_US_CITIES.some(city => new RegExp(`(?:^|[,\\s\\/])${city}(?:[\\s,;\\/]|$)`).test(text))) return true;
+  return US_STATE_CODES.some(code => new RegExp(`(?:^|[,\\s\\/])${code}(?:[\\s,;\\/]|$)`).test(text)) || /\bUS\b/.test(text) || text.includes("U.S.");
 }
 
-// ---------- Helpers (Verified Logic) ----------
+// ---------- Helpers ----------
 function normalizeJobsFromFeedJson(json) {
   if (Array.isArray(json)) return json;
-  if (json && Array.isArray(json.jobs)) return json.jobs;
-  if (json && Array.isArray(json.data)) return json.data;
+  if (json?.jobs && Array.isArray(json.jobs)) return json.jobs;
+  if (json?.data && Array.isArray(json.data)) return json.data;
   return [];
 }
 
 function safeJobKey(sourceUrl, job) {
-  if (job && (job.id || job._id)) return String(job.id || job._id);
-  const base = `${sourceUrl}::${job?.absolute_url || ""}::${job?.title || ""}`;
-  return Buffer.from(base).toString("base64").replace(/=+$/g, "");
+  if (job?.id || job?._id) return String(job.id || job._id);
+  return Buffer.from(`${sourceUrl}::${job?.absolute_url || ""}::${job?.title || ""}`).toString("base64").replace(/=+$/g, "");
 }
 
 function safeCompanyKey(companyName, fallbackUrl) {
   const raw = (companyName || "").trim();
   if (raw) {
-    const slug = raw.toLowerCase().replace(/&/g, "and").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
-    return slug || Buffer.from(raw).toString("base64").replace(/=+$/g, "");
+    return raw.toLowerCase().replace(/&/g, "and").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || Buffer.from(raw).toString("base64").replace(/=+$/g, "");
   }
-  const u = String(fallbackUrl || "").toLowerCase();
-  const m = u.match(/\/v1\/boards\/([^/]+)\//);
-  return m?.[1] ? m[1].replace(/[^a-z0-9\-]+/g, "-").slice(0, 80) : Buffer.from(u).toString("base64").replace(/=+$/g, "").slice(0, 80);
+  const m = String(fallbackUrl).match(/\/v1\/boards\/([^/]+)\//);
+  return m?.[1] ? m[1].replace(/[^a-z0-9\-]+/g, "-").slice(0, 80) : Buffer.from(fallbackUrl).toString("base64").replace(/=+$/g, "").slice(0, 80);
 }
 
 async function fetchJson(url) {
@@ -81,19 +53,16 @@ async function fetchJson(url) {
 
 async function pollForUser(uid, runType = "scheduled") {
   const userRef = db.collection("users").doc(uid);
+
+  // --- Scheduler Pause Check ---
+  if (runType === "scheduled") {
+    const userSnap = await userRef.get();
+    if (userSnap.data()?.schedulerEnabled === false) return { skipped: true };
+  }
+
   const runRef = userRef.collection("fetchRuns").doc();
   const startedAtMs = Date.now();
-
-  await runRef.set({
-    runType,
-    startedAt: admin.firestore.FieldValue.serverTimestamp(),
-    finishedAt: null,
-    durationMs: null,
-    feedsCount: 0,
-    newCount: 0,
-    errorsCount: 0,
-    errorSamples: [],
-  });
+  await runRef.set({ runType, startedAt: admin.firestore.FieldValue.serverTimestamp(), finishedAt: null, durationMs: null, feedsCount: 0, newCount: 0, errorsCount: 0, errorSamples: [] });
 
   const feedsSnap = await userRef.collection("feeds").get();
   const activeFeeds = feedsSnap.docs.map(d => ({ id: d.id, ...d.data() })).filter(f => !f.archivedAt);
@@ -108,40 +77,25 @@ async function pollForUser(uid, runType = "scheduled") {
         const json = await fetchJson(feed.url);
         const jobs = normalizeJobsFromFeedJson(json);
         let batch = db.batch();
-        let ops = 0;
-        let feedNewCount = 0;
+        let ops = 0, feedNewCount = 0;
 
         for (const job of jobs) {
           const locName = job?.location?.name || job.location_name || "";
-          if (!isUSLocation(locName)) continue; 
+          if (!isUSLocation(locName)) continue;
 
           const companyName = (job.company_name || feed.company || "Unknown").trim();
           const companyKey = safeCompanyKey(companyName, feed.url);
-          const companyRef = userRef.collection("companies").doc(companyKey);
           const jobKey = safeJobKey(feed.url, job);
-          const jobRef = companyRef.collection("jobs").doc(jobKey);
+          const jobRef = userRef.collection("companies").doc(companyKey).collection("jobs").doc(jobKey);
 
-          const existing = await jobRef.get();
-          if (existing.exists) continue;
+          if ((await jobRef.get()).exists) continue;
 
-          batch.set(companyRef, { companyName, companyKey, lastSeenAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-          batch.set(jobRef, {
-            uid: uid,
-            title: job.title || job.name || null,
-            absolute_url: job.absolute_url || job.url || null,
-            locationName: locName,
-            companyName,
-            companyKey,
-            updatedAtIso: job.updated_at || null,
-            firstSeenAt: admin.firestore.FieldValue.serverTimestamp(),
-            saved: false
-          });
+          batch.set(userRef.collection("companies").doc(companyKey), { companyName, companyKey, lastSeenAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+          batch.set(jobRef, { uid, title: job.title || job.name || null, absolute_url: job.absolute_url || job.url || null, locationName: locName, companyName, companyKey, updatedAtIso: job.updated_at || null, firstSeenAt: admin.firestore.FieldValue.serverTimestamp(), saved: false });
           
-          ops += 2;
-          feedNewCount++;
+          ops += 2; feedNewCount++;
           if (ops >= 400) { await batch.commit(); batch = db.batch(); ops = 0; }
         }
-        
         if (ops > 0) await batch.commit();
         totalNewCount += feedNewCount;
         await userRef.collection("feeds").doc(feed.id).set({ lastCheckedAt: admin.firestore.FieldValue.serverTimestamp(), lastError: null }, { merge: true });
@@ -151,19 +105,11 @@ async function pollForUser(uid, runType = "scheduled") {
       }
     }
   } finally {
-    await runRef.update({
-      finishedAt: admin.firestore.FieldValue.serverTimestamp(),
-      durationMs: Date.now() - startedAtMs,
-      feedsCount: activeFeeds.length,
-      newCount: totalNewCount,
-      errorsCount,
-      errorSamples
-    });
+    await runRef.update({ finishedAt: admin.firestore.FieldValue.serverTimestamp(), durationMs: Date.now() - startedAtMs, feedsCount: activeFeeds.length, newCount: totalNewCount, errorsCount, errorSamples });
   }
   return { newCount: totalNewCount, feeds: activeFeeds.length };
 }
 
-// ----------------- Exports -----------------
 exports.pollGreenhouseFeeds = functions.pubsub.schedule("every 30 minutes").onRun(async () => {
   const usersSnap = await db.collection("users").get();
   for (const doc of usersSnap.docs) { await pollForUser(doc.id, "scheduled"); }
