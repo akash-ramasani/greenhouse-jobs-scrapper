@@ -1,7 +1,7 @@
 /**
  * functions/index.js
  * Node runtime: 20
- * Optimized: US-Filter + Robust History Logging + Scheduler Pause Logic
+ * Fixed: Robust History Logging + US Filter + Scheduler Logic
  */
 
 const functions = require("firebase-functions");
@@ -53,31 +53,48 @@ async function fetchJson(url) {
 
 async function pollForUser(uid, runType = "scheduled") {
   const userRef = db.collection("users").doc(uid);
-
-  // --- Scheduler Pause Check ---
+  
+  // 1. Check if scheduler is enabled before doing anything
   if (runType === "scheduled") {
     const userSnap = await userRef.get();
-    if (userSnap.data()?.schedulerEnabled === false) return { skipped: true };
+    if (userSnap.exists && userSnap.data()?.schedulerEnabled === false) {
+      return { skipped: true };
+    }
   }
 
+  // 2. Initialize Run Log document immediately
   const runRef = userRef.collection("fetchRuns").doc();
   const startedAtMs = Date.now();
-  await runRef.set({ runType, startedAt: admin.firestore.FieldValue.serverTimestamp(), finishedAt: null, durationMs: null, feedsCount: 0, newCount: 0, errorsCount: 0, errorSamples: [] });
+  
+  await runRef.set({ 
+    runType, 
+    startedAt: admin.firestore.FieldValue.serverTimestamp(), 
+    finishedAt: null, 
+    durationMs: null, 
+    feedsCount: 0, 
+    newCount: 0, 
+    errorsCount: 0, 
+    errorSamples: [] 
+  });
 
   const feedsSnap = await userRef.collection("feeds").get();
-  const activeFeeds = feedsSnap.docs.map(d => ({ id: d.id, ...d.data() })).filter(f => !f.archivedAt);
+  const activeFeeds = feedsSnap.docs
+    .map(d => ({ id: d.id, ...d.data() }))
+    .filter(f => !f.archivedAt);
 
   let totalNewCount = 0;
   let errorsCount = 0;
   const errorSamples = [];
 
+  // 3. Main processing loop
   try {
     for (const feed of activeFeeds) {
       try {
         const json = await fetchJson(feed.url);
         const jobs = normalizeJobsFromFeedJson(json);
         let batch = db.batch();
-        let ops = 0, feedNewCount = 0;
+        let ops = 0;
+        let feedNewCount = 0;
 
         for (const job of jobs) {
           const locName = job?.location?.name || job.location_name || "";
@@ -88,31 +105,84 @@ async function pollForUser(uid, runType = "scheduled") {
           const jobKey = safeJobKey(feed.url, job);
           const jobRef = userRef.collection("companies").doc(companyKey).collection("jobs").doc(jobKey);
 
-          if ((await jobRef.get()).exists) continue;
+          // Check if job exists to avoid duplicates
+          const jobSnap = await jobRef.get();
+          if (jobSnap.exists) continue;
 
-          batch.set(userRef.collection("companies").doc(companyKey), { companyName, companyKey, lastSeenAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-          batch.set(jobRef, { uid, title: job.title || job.name || null, absolute_url: job.absolute_url || job.url || null, locationName: locName, companyName, companyKey, updatedAtIso: job.updated_at || null, firstSeenAt: admin.firestore.FieldValue.serverTimestamp(), saved: false });
+          // Set Company metadata
+          batch.set(userRef.collection("companies").doc(companyKey), { 
+            companyName, 
+            companyKey, 
+            lastSeenAt: admin.firestore.FieldValue.serverTimestamp() 
+          }, { merge: true });
+
+          // Set Job data
+          batch.set(jobRef, { 
+            uid, 
+            title: job.title || job.name || null, 
+            absolute_url: job.absolute_url || job.url || null, 
+            locationName: locName, 
+            companyName, 
+            companyKey, 
+            updatedAtIso: job.updated_at || null, 
+            firstSeenAt: admin.firestore.FieldValue.serverTimestamp(), 
+            saved: false 
+          });
           
-          ops += 2; feedNewCount++;
-          if (ops >= 400) { await batch.commit(); batch = db.batch(); ops = 0; }
+          ops += 2; 
+          feedNewCount++;
+
+          if (ops >= 400) { 
+            await batch.commit(); 
+            batch = db.batch(); 
+            ops = 0; 
+          }
         }
+
         if (ops > 0) await batch.commit();
         totalNewCount += feedNewCount;
-        await userRef.collection("feeds").doc(feed.id).set({ lastCheckedAt: admin.firestore.FieldValue.serverTimestamp(), lastError: null }, { merge: true });
+
+        // Update feed status
+        await userRef.collection("feeds").doc(feed.id).set({ 
+          lastCheckedAt: admin.firestore.FieldValue.serverTimestamp(), 
+          lastNewCount: feedNewCount,
+          lastError: null 
+        }, { merge: true });
+
       } catch (err) {
         errorsCount++;
         if (errorSamples.length < 5) errorSamples.push({ url: feed.url, message: err.message });
+        
+        await userRef.collection("feeds").doc(feed.id).set({ 
+          lastCheckedAt: admin.firestore.FieldValue.serverTimestamp(), 
+          lastError: err.message 
+        }, { merge: true });
       }
     }
   } finally {
-    await runRef.update({ finishedAt: admin.firestore.FieldValue.serverTimestamp(), durationMs: Date.now() - startedAtMs, feedsCount: activeFeeds.length, newCount: totalNewCount, errorsCount, errorSamples });
+    // 4. Always close the run log with final stats
+    await runRef.update({ 
+      finishedAt: admin.firestore.FieldValue.serverTimestamp(), 
+      durationMs: Date.now() - startedAtMs, 
+      feedsCount: activeFeeds.length, 
+      newCount: totalNewCount, 
+      errorsCount, 
+      errorSamples 
+    });
   }
+
   return { newCount: totalNewCount, feeds: activeFeeds.length };
 }
 
 exports.pollGreenhouseFeeds = functions.pubsub.schedule("every 30 minutes").onRun(async () => {
   const usersSnap = await db.collection("users").get();
-  for (const doc of usersSnap.docs) { await pollForUser(doc.id, "scheduled"); }
+  for (const doc of usersSnap.docs) { 
+    try {
+      await pollForUser(doc.id, "scheduled"); 
+    } catch (e) {
+      console.error(`Scheduled poll failed for user ${doc.id}:`, e);
+    }
+  }
 });
 
 exports.pollNow = functions.https.onCall(async (data, context) => {
