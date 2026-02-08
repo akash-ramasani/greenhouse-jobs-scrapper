@@ -11,12 +11,21 @@
  * - updatedAtTs (Timestamp)  <-- required for proper sorting + timeframe query
  * - stateCodes (array)       <-- required for multi-state filtering
  * - perFeedSummary (array)   <-- for FetchHistory UI
+ *
+ * IMPORTANT UPDATE IN THIS VERSION:
+ * - Scheduled poll now ALWAYS writes a fetchRuns doc per user with status:
+ *   - "enqueued" (task enqueued successfully)
+ *   - "enqueue_failed" (enqueue failed)
+ *   - then task updates that SAME run doc to "running" and later "done"/"done_with_errors"
+ *
+ * This means you will see fetchRuns even if the task never executes.
  */
 
 const admin = require("firebase-admin");
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { onTaskDispatched } = require("firebase-functions/v2/tasks");
+const logger = require("firebase-functions/logger");
 const pLimit = require("p-limit").default;
 
 admin.initializeApp();
@@ -27,7 +36,10 @@ const { FieldValue, Timestamp } = admin.firestore;
 const REGION = "us-central1";
 const FEED_CONCURRENCY = 8;       // safe for ~350 feeds
 const JOB_WRITE_CONCURRENCY = 25; // safe for job upserts
-const SCHEDULE = "every 30 minutes";
+
+// If you want strict 30-minute cadence anchored to the clock, use cron:
+const SCHEDULE = "*/30 * * * *";
+const TIME_ZONE = "America/Los_Angeles";
 
 // If you want "remote anywhere worldwide", set this to [].
 const REMOTE_EXCLUDE_SUBSTRINGS = [
@@ -536,17 +548,63 @@ async function processOneFeed(uid, feed) {
   };
 }
 
-async function processUserFeeds(uid, runType) {
+// ------------------------ FETCH RUN HELPERS ------------------------
+function fetchRunRef(uid, runId) {
+  return db.collection("users").doc(uid).collection("fetchRuns").doc(runId);
+}
+
+/**
+ * Creates a run doc and returns { runId, ref }.
+ * This is used by the scheduler so you always see fetchRuns even if tasks never execute.
+ */
+async function createFetchRun(uid, runType, initialStatus, extra = {}) {
+  const ref = db.collection("users").doc(uid).collection("fetchRuns").doc();
+  await ref.set({
+    runType,
+    status: initialStatus,
+    createdAt: FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
+    ...extra,
+  });
+  return { runId: ref.id, ref };
+}
+
+/**
+ * processUserFeeds now supports reusing an existing runId doc.
+ * - If runId provided, it updates that run doc to "running" and proceeds.
+ * - If no runId, it creates a new run doc (manual calls).
+ */
+async function processUserFeeds(uid, runType, runId = null) {
   const startedAtMs = Date.now();
+
   const feeds = await loadUserFeeds(uid);
 
-  const runRef = db.collection("users").doc(uid).collection("fetchRuns").doc();
-  await runRef.set({
-    runType,
-    status: "running",
-    startedAt: FieldValue.serverTimestamp(),
-    feedsCount: feeds.length,
-  });
+  let runRef;
+  if (runId) {
+    runRef = fetchRunRef(uid, runId);
+    // Mark as running (even if it was "enqueued")
+    await runRef.set(
+      {
+        runType,
+        status: "running",
+        startedAt: FieldValue.serverTimestamp(),
+        feedsCount: feeds.length,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+  } else {
+    runRef = db.collection("users").doc(uid).collection("fetchRuns").doc();
+    await runRef.set({
+      runType,
+      status: "running",
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+      startedAt: FieldValue.serverTimestamp(),
+      feedsCount: feeds.length,
+    });
+    runId = runRef.id;
+  }
 
   const limitFeed = pLimit(FEED_CONCURRENCY);
 
@@ -597,6 +655,7 @@ async function processUserFeeds(uid, runType) {
     {
       status: errorSamples.length ? "done_with_errors" : "done",
       finishedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
       durationMs,
       processed: processedTotal,
       newCount: newTotal,
@@ -608,7 +667,7 @@ async function processUserFeeds(uid, runType) {
   );
 
   return {
-    runId: runRef.id,
+    runId,
     feedsCount: feeds.length,
     processed: processedTotal,
     newCount: newTotal,
@@ -632,26 +691,56 @@ exports.pollNowV2 = onCall({ region: REGION }, async (req) => {
 });
 
 /**
- * Scheduled poll every 30 minutes: enqueues a task per user
+ * Scheduled poll: creates a fetchRuns doc per user (status=enqueued or enqueue_failed),
+ * then enqueues a task that will update the SAME run doc to running/done.
  */
-exports.pollGreenhouseFeedsV2 = onSchedule({ region: REGION, schedule: SCHEDULE }, async () => {
-  const usersSnap = await db.collection("users").get();
-  const queue = admin.app().functions().taskQueue("pollUserTaskV2");
+exports.pollGreenhouseFeedsV2 = onSchedule(
+  { region: REGION, schedule: SCHEDULE, timeZone: TIME_ZONE },
+  async () => {
+    const usersSnap = await db.collection("users").get();
+    logger.info("scheduler tick", { users: usersSnap.size, schedule: SCHEDULE, tz: TIME_ZONE });
 
-  const limitEnq = pLimit(50);
-  await Promise.all(
-    usersSnap.docs.map((u) =>
-      limitEnq(async () => {
-        await queue.enqueue({ uid: u.id, runType: "scheduled" });
-      })
-    )
-  );
+    const queue = admin.app().functions().taskQueue("pollUserTaskV2");
+    const limitEnq = pLimit(50);
 
-  return null;
-});
+    await Promise.all(
+      usersSnap.docs.map((u) =>
+        limitEnq(async () => {
+          const uid = u.id;
+
+          // Write fetchRuns immediately so UI shows scheduled activity even if task never runs.
+          const { runId, ref } = await createFetchRun(uid, "scheduled", "enqueued", {
+            enqueuedAt: FieldValue.serverTimestamp(),
+          });
+
+          try {
+            await queue.enqueue({ uid, runType: "scheduled", runId });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+
+            // Mark enqueue failure on the run doc
+            await ref.set(
+              {
+                status: "enqueue_failed",
+                updatedAt: FieldValue.serverTimestamp(),
+                enqueueError: msg,
+              },
+              { merge: true }
+            );
+
+            logger.error("enqueue failed", { uid, runId, error: msg });
+          }
+        })
+      )
+    );
+
+    return null;
+  }
+);
 
 /**
  * Task handler: polls feeds for a single user
+ * - Expects { uid, runType, runId }
  */
 exports.pollUserTaskV2 = onTaskDispatched(
   {
@@ -660,8 +749,34 @@ exports.pollUserTaskV2 = onTaskDispatched(
     retryConfig: { maxAttempts: 3, minBackoffSeconds: 60 },
   },
   async (req) => {
-    const { uid, runType } = req.data || {};
+    const { uid, runType, runId } = req.data || {};
     if (!uid) return;
-    await processUserFeeds(uid, runType || "scheduled");
+
+    logger.info("task start", { uid, runType, runId });
+
+    try {
+      await processUserFeeds(uid, runType || "scheduled", runId || null);
+      logger.info("task done", { uid, runType, runId });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+
+      // If we have a runId, mark it as failed so it shows in the UI
+      if (runId) {
+        await fetchRunRef(uid, runId).set(
+          {
+            status: "failed",
+            updatedAt: FieldValue.serverTimestamp(),
+            finishedAt: FieldValue.serverTimestamp(),
+            error: msg,
+          },
+          { merge: true }
+        );
+      }
+
+      logger.error("task failed", { uid, runType, runId, error: msg });
+
+      // Re-throw so Cloud Tasks retryConfig actually retries
+      throw err;
+    }
   }
 );
