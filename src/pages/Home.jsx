@@ -80,23 +80,28 @@ export default function Home({ user }) {
   }
 
   async function fetchNow() {
-    setBusyNow(true);
-    try {
-      const functions = getFunctions();
-      const callFn = httpsCallable(functions, "pollNow");
-      const resp = await callFn({});
-      const data = resp.data || {};
-      
-      showToast(
-        `Fetched ${data.feeds ?? 0} feed(s). ${data.newCount ?? 0} new job(s).`,
-        "success"
-      );
-    } catch (err) {
-      showToast("Manual fetch failed. Try again later.", "error");
-    } finally {
-      setBusyNow(false);
-    }
+  setBusyNow(true);
+  try {
+    // IMPORTANT: use the same region you deployed the Gen2 functions to
+    const functions = getFunctions(undefined, "us-central1");
+
+    // IMPORTANT: call the V2 callable name you deployed (Option A)
+    const callFn = httpsCallable(functions, "pollNowV2");
+
+    const resp = await callFn({});
+    const data = resp.data || {};
+
+    // Your V2 returns { enqueued: true }, not {feeds,newCount} immediately.
+    // So show a different message.
+    showToast("Fetch started. New jobs will appear shortly.", "success");
+  } catch (err) {
+    console.error(err);
+    showToast("Manual fetch failed. Try again later.", "error");
+  } finally {
+    setBusyNow(false);
   }
+}
+
 
   async function archiveFeed(feedId) {
     setBusyArchiveId(feedId);
