@@ -79,23 +79,30 @@ export default function Jobs({ user }) {
   const { showToast } = useToast();
 
   const [companies, setCompanies] = useState([]);
-  const [companyNameByKey, setCompanyNameByKey] = useState({}); // <-- map key => name
+  const [companyNameByKey, setCompanyNameByKey] = useState({});
   const [selectedKeys, setSelectedKeys] = useState([]);
 
   const [jobs, setJobs] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [isProcessing, setIsProcessing] = useState(true);
+  const [loading, setLoading] = useState(true); // skeleton only when we have no data
+  const [isProcessing, setIsProcessing] = useState(true); // shimmer overlay
   const [lastDoc, setLastDoc] = useState(null);
   const [hasMore, setHasMore] = useState(true);
 
   const [titleSearch, setTitleSearch] = useState("");
   const [stateFilter, setStateFilter] = useState("");
-  const [timeframe, setTimeframe] = useState("1h"); // default Last 1h
+  const [timeframe, setTimeframe] = useState("1h");
   const [isFilterExpanded, setIsFilterExpanded] = useState(false);
 
   const observer = useRef(null);
 
-  // Load companies (and build key=>name map)
+  const resetAll = useCallback(() => {
+    setTitleSearch("");
+    setStateFilter("");
+    setTimeframe("1h");
+    setSelectedKeys([]);
+  }, []);
+
+  // Load companies
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -106,7 +113,6 @@ export default function Jobs({ user }) {
 
         const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
 
-        // Build a stable map of companyKey => companyName
         const map = {};
         for (const c of list) {
           const name = (c.companyName || c.name || "").trim();
@@ -122,99 +128,98 @@ export default function Jobs({ user }) {
       }
     })();
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [user.uid]);
 
   /**
-   * SORTING (how jobs are sorted)
-   * - For timeframe != "all":
-   *     we do server-side filtering: where(updatedAtTs >= threshold) and orderBy(updatedAtTs desc)
-   * - For timeframe == "all":
-   *     if some docs might not have updatedAtTs, we fallback to orderBy(firstSeenAt desc)
+   * Query:
+   * - Always order by updatedAtTs desc
+   * - If timeframe != "all": add where(updatedAtTs >= threshold)
    *
-   * If your DB truly has NO updatedAtTs yet, you must add it in the backend writes,
-   * otherwise the timeframe queries will fail.
+   * UX:
+   * - Initial load => skeleton
+   * - Filter change => keep old list, show shimmer overlay until refreshed list arrives
    */
-  const fetchJobs = useCallback(async (isFirstPage = true) => {
-    setLoading(true);
-    setIsProcessing(true);
+  const fetchJobs = useCallback(
+    async (isFirstPage = true) => {
+      if (jobs.length === 0 && isFirstPage) setLoading(true);
+      setIsProcessing(true);
 
-    try {
-      const jobsQueryBase = collectionGroup(db, "jobs");
-      const constraints = [];
+      try {
+        const jobsQueryBase = collectionGroup(db, "jobs");
+        const constraints = [];
 
-      // You are currently writing jobs under users/{uid}/jobs, so each job doc should include uid
-      constraints.push(where("uid", "==", user.uid));
+        constraints.push(where("uid", "==", user.uid));
 
-      // Company filter (supports single/multi)
-      if (selectedKeys.length > 0) {
-        constraints.push(where("companyKey", "in", selectedKeys.slice(0, 10)));
-      }
+        if (selectedKeys.length > 0) {
+          constraints.push(where("companyKey", "in", selectedKeys.slice(0, 10)));
+        }
 
-      if (timeframe === "all") {
-        // "all" mode: legacy-safe sort (works even if updatedAtTs missing)
-        constraints.push(orderBy("firstSeenAt", "desc"));
-      } else {
-        // timeframe mode: requires updatedAtTs to exist on every job doc
-        const thresholdTs = timeframeToThresholdTs(timeframe);
-        if (thresholdTs) constraints.push(where("updatedAtTs", ">=", thresholdTs));
         constraints.push(orderBy("updatedAtTs", "desc"));
+
+        if (timeframe !== "all") {
+          const thresholdTs = timeframeToThresholdTs(timeframe);
+          if (thresholdTs) constraints.push(where("updatedAtTs", ">=", thresholdTs));
+        }
+
+        constraints.push(limit(PAGE_SIZE));
+        if (!isFirstPage && lastDoc) constraints.push(startAfter(lastDoc));
+
+        const qJobs = query(jobsQueryBase, ...constraints);
+        const snap = await getDocs(qJobs);
+
+        const docs = snap.docs.map((d) => ({
+          id: d.id,
+          ...d.data(),
+          _path: d.ref.path,
+        }));
+
+        setJobs((prev) => (isFirstPage ? docs : [...prev, ...docs]));
+        setLastDoc(snap.docs[snap.docs.length - 1] || null);
+        setHasMore(snap.docs.length === PAGE_SIZE);
+      } catch (err) {
+        console.error("Fetch jobs error:", err);
+        showToast("Error loading jobs.", "error");
+        setHasMore(false);
+      } finally {
+        setTimeout(() => {
+          setLoading(false);
+          setIsProcessing(false);
+        }, 150);
       }
+    },
+    [user.uid, selectedKeys, lastDoc, timeframe, showToast, jobs.length]
+  );
 
-      constraints.push(limit(PAGE_SIZE));
-      if (!isFirstPage && lastDoc) constraints.push(startAfter(lastDoc));
-
-      const qJobs = query(jobsQueryBase, ...constraints);
-      const snap = await getDocs(qJobs);
-
-      const docs = snap.docs.map((d) => ({
-        id: d.id,
-        ...d.data(),
-        _path: d.ref.path,
-      }));
-
-      setJobs((prev) => (isFirstPage ? docs : [...prev, ...docs]));
-      setLastDoc(snap.docs[snap.docs.length - 1] || null);
-      setHasMore(snap.docs.length === PAGE_SIZE);
-    } catch (err) {
-      console.error("Fetch jobs error:", err);
-      showToast("Error loading jobs.", "error");
-      setHasMore(false);
-    } finally {
-      setTimeout(() => {
-        setLoading(false);
-        setIsProcessing(false);
-      }, 150);
-    }
-  }, [user.uid, selectedKeys, lastDoc, timeframe, showToast]);
-
-  // Reset paging when filters change
+  // Filter changes: refresh first page but keep list visible
   useEffect(() => {
     setLastDoc(null);
-    setJobs([]);
     setHasMore(true);
     fetchJobs(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedKeys, timeframe]);
 
-  const lastElementRef = useCallback((node) => {
-    if (loading || !hasMore) return;
-    if (observer.current) observer.current.disconnect();
+  const lastElementRef = useCallback(
+    (node) => {
+      if (loading || !hasMore) return;
+      if (observer.current) observer.current.disconnect();
 
-    observer.current = new IntersectionObserver(
-      (entries) => {
-        if (entries[0].isIntersecting && hasMore && !loading) fetchJobs(false);
-      },
-      { rootMargin: "400px", threshold: 0 }
-    );
+      observer.current = new IntersectionObserver(
+        (entries) => {
+          if (entries[0].isIntersecting && hasMore && !loading) fetchJobs(false);
+        },
+        { rootMargin: "400px", threshold: 0 }
+      );
 
-    if (node) observer.current.observe(node);
-  }, [loading, hasMore, fetchJobs]);
+      if (node) observer.current.observe(node);
+    },
+    [loading, hasMore, fetchJobs]
+  );
 
   const toggleCompany = (key) => {
-    setSelectedKeys((prev) =>
-      prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]
-    );
+    setSelectedKeys((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
   };
 
   const toggleBookmark = async (e, job) => {
@@ -225,19 +230,15 @@ export default function Jobs({ user }) {
 
     try {
       await updateDoc(doc(db, job._path), { saved: newState });
-      showToast(newState ? "Job pinned" : "Pin removed", "info");
+      showToast(newState ? "📌 Saved to review list" : "📍 Removed from review list", "info");
     } catch (err) {
       console.error("Bookmark update error:", err);
       setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, saved: !newState } : j)));
-      showToast("Error updating bookmark", "error");
+      showToast("Error updating saved state", "error");
     }
   };
 
-  /**
-   * State filtering:
-   * Right now this is CLIENT-SIDE using locationName text.
-   * If you want multi-state server-side filtering, you need backend to store stateCodes: ["CA","NY"].
-   */
+  // Client-side filters
   const filteredJobs = useMemo(() => {
     const titleTerm = titleSearch.trim().toLowerCase();
 
@@ -254,8 +255,14 @@ export default function Jobs({ user }) {
     });
   }, [jobs, titleSearch, stateFilter]);
 
+  /**
+   * ✅ CONSISTENT UI ACROSS ALL TIMEFRAMES:
+   * Always split pinned/saved items into their own section
+   * (when viewing ALL companies; if you want it even when filtering companies, remove selectedKeys.length === 0).
+   */
+  const showPinnedSeparately = selectedKeys.length === 0;
+
   const { bookmarkedJobs, regularJobs } = useMemo(() => {
-    const showPinnedSeparately = selectedKeys.length === 0 && timeframe === "all";
     if (showPinnedSeparately) {
       return {
         bookmarkedJobs: filteredJobs.filter((j) => j.saved),
@@ -263,10 +270,9 @@ export default function Jobs({ user }) {
       };
     }
     return { bookmarkedJobs: [], regularJobs: filteredJobs };
-  }, [filteredJobs, selectedKeys, timeframe]);
+  }, [filteredJobs, showPinnedSeparately]);
 
   const displayCompanyName = (job) => {
-    // Prefer job.companyName (stored on job doc); fallback to companies map; fallback to companyKey
     const byDoc = (job.companyName || "").trim();
     if (byDoc) return byDoc;
 
@@ -276,67 +282,84 @@ export default function Jobs({ user }) {
     return job.companyKey || "Unknown";
   };
 
-  const renderJobItem = (job) => (
-    <li
-      key={job.id}
-      className="group relative px-6 py-5 hover:bg-gray-50/80 transition-all border-l-4 border-transparent hover:border-indigo-500"
-    >
-      <div className="absolute top-0 left-0 right-0 h-[1px] bg-indigo-500 opacity-0 group-hover:opacity-100 transition-opacity" />
-      <div className="flex items-center justify-between">
-        <a href={job.absolute_url || "#"} target="_blank" rel="noreferrer" className="min-w-0 flex-1">
-          <div className="flex items-center gap-2 mb-1.5">
-            <span className="text-xs font-bold text-indigo-600 uppercase tracking-tight">
-              {displayCompanyName(job)}
-            </span>
-            <span className="text-gray-300">|</span>
-            <span className="text-xs text-gray-500 font-medium truncate">
-              {job.locationName || "Remote"}
-            </span>
-          </div>
+  const TS_HELP = {
+    discovered: "When JobWatch first discovered this role.",
+    lastChange: "Most recent change detected for this role (posting updates, content changes, etc.).",
+  };
 
-          <h3 className="text-base font-semibold text-gray-900 group-hover:text-indigo-600 transition-colors truncate">
-            {job.title}
-          </h3>
+  const renderJobItem = (job) => {
+    const lastChangeShort = shortAgoFromISO(job.updatedAtIso);
 
-          <div className="mt-1 text-xs text-gray-400">
-            Fetched {timeAgoFromFirestore(job.firstSeenAt)}
-          </div>
-        </a>
+    return (
+      <li
+        key={job.id}
+        className="group relative px-6 py-5 hover:bg-gray-50/80 transition-all border-l-4 border-transparent hover:border-indigo-500"
+      >
+        <div className="absolute top-0 left-0 right-0 h-[1px] bg-indigo-500 opacity-0 group-hover:opacity-100 transition-opacity" />
 
-        <div className="flex items-center gap-4 ml-4">
-          <button
-            onClick={(e) => toggleBookmark(e, job)}
-            className={`p-2 rounded-full transition-colors ${
-              job.saved ? "text-amber-500 bg-amber-50" : "text-gray-300 hover:bg-gray-100 hover:text-gray-500"
-            }`}
-          >
-            <svg
-              className="size-5"
-              fill={job.saved ? "currentColor" : "none"}
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-              strokeWidth="2"
+        <div className="flex items-center justify-between gap-4">
+          <a href={job.absolute_url || "#"} target="_blank" rel="noreferrer" className="min-w-0 flex-1">
+            <div className="flex items-center gap-2 mb-1.5">
+              <span className="text-xs font-bold text-indigo-600 uppercase tracking-tight">
+                {displayCompanyName(job)}
+              </span>
+              <span className="text-gray-300">|</span>
+              <span className="text-xs text-gray-500 font-medium truncate">
+                {job.locationName || "Remote"}
+              </span>
+            </div>
+
+            <h3 className="text-base font-semibold text-gray-900 group-hover:text-indigo-600 transition-colors truncate">
+              {job.title}
+            </h3>
+
+            <div className="mt-1 text-xs text-gray-400 flex flex-wrap items-center gap-x-3 gap-y-1">
+              <span title={TS_HELP.discovered}>Discovered {timeAgoFromFirestore(job.firstSeenAt)}</span>
+
+              <span className="sm:hidden inline-flex items-center gap-1" title={TS_HELP.lastChange}>
+                <span className="text-gray-300">•</span>
+                <span>
+                  Last change <span className="font-semibold text-gray-700">{lastChangeShort}</span>
+                </span>
+              </span>
+            </div>
+          </a>
+
+          <div className="flex items-center gap-4 flex-shrink-0">
+            <button
+              onClick={(e) => toggleBookmark(e, job)}
+              className={`p-2 rounded-full transition-colors ${
+                job.saved ? "text-amber-500 bg-amber-50" : "text-gray-300 hover:bg-gray-100 hover:text-gray-500"
+              }`}
+              aria-label={job.saved ? "Remove from review list" : "Save to review list"}
+              title={job.saved ? "Saved to review list" : "Save to review list"}
             >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z"
-              />
-            </svg>
-          </button>
+              <svg
+                className="size-5"
+                fill={job.saved ? "currentColor" : "none"}
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                strokeWidth="2"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z"
+                />
+              </svg>
+            </button>
 
-          <div className="hidden sm:flex flex-col items-end">
-            <span className="text-[10px] font-black text-gray-300 group-hover:text-indigo-200 uppercase tracking-tighter transition-colors">
-              Updated
-            </span>
-            <span className="text-sm font-bold text-gray-900">
-              {shortAgoFromISO(job.updatedAtIso)}
-            </span>
+            <div className="hidden sm:flex flex-col items-end min-w-[92px]" title={TS_HELP.lastChange}>
+              <span className="text-[10px] font-black text-gray-300 group-hover:text-indigo-200 uppercase tracking-tighter transition-colors">
+                Last change
+              </span>
+              <span className="text-sm font-bold text-gray-900">{lastChangeShort}</span>
+            </div>
           </div>
         </div>
-      </div>
-    </li>
-  );
+      </li>
+    );
+  };
 
   const renderSkeleton = () => (
     <div className="px-6 py-8 border-b border-gray-100 animate-pulse">
@@ -345,6 +368,10 @@ export default function Jobs({ user }) {
       <div className="h-3 w-40 bg-gray-100 rounded" />
     </div>
   );
+
+  const progressLabel = useMemo(() => {
+    return `Showing ${filteredJobs.length}${hasMore ? "+" : ""} roles`;
+  }, [filteredJobs.length, hasMore]);
 
   return (
     <div className="py-8 px-4 md:px-0 min-h-screen" style={{ fontFamily: "Ubuntu, sans-serif" }}>
@@ -396,6 +423,7 @@ export default function Jobs({ user }) {
                 ? "bg-indigo-50 border-indigo-200 text-indigo-600 shadow-inner"
                 : "bg-white border-gray-200 text-gray-400 hover:bg-gray-50"
             }`}
+            aria-label={isFilterExpanded ? "Hide filters" : "Show filters"}
           >
             <svg viewBox="0 0 20 20" fill="currentColor" className="size-5 transition-transform duration-300">
               <path d="M2.628 1.601C5.028 1.206 7.49 1 10 1s4.973.206 7.372.601a.75.75 0 0 1 .628.74v2.288a2.25 2.25 0 0 1-.659 1.59l-4.682 4.683a2.25 2.25 0 0 0-.659 1.59v3.037c0 .684-.31 1.33-.844 1.757l-1.937 1.55A.75.75 0 0 1 8 18.25v-5.757a2.25 2.25 0 0 0-.659-1.591L2.659 6.22A2.25 2.25 0 0 1 2 4.629V2.34a.75.75 0 0 1 .628-.74Z" />
@@ -404,15 +432,7 @@ export default function Jobs({ user }) {
         </div>
 
         <div className="pt-6">
-          <button
-            onClick={() => {
-              setTitleSearch("");
-              setStateFilter("");
-              setTimeframe("1h");
-              setSelectedKeys([]); // all companies
-            }}
-            className="text-xs font-bold text-gray-400 hover:text-indigo-600 px-2"
-          >
+          <button onClick={resetAll} className="text-xs font-bold text-gray-400 hover:text-indigo-600 px-2">
             Reset All
           </button>
         </div>
@@ -505,7 +525,7 @@ export default function Jobs({ user }) {
                               ? "bg-indigo-600 text-white shadow-md shadow-indigo-100"
                               : "bg-white text-gray-500 ring-1 ring-inset ring-gray-200 hover:bg-gray-50"
                           }`}
-                          title={c.id} // hover shows the key if you ever need it
+                          title={c.id}
                         >
                           {label}
                         </button>
@@ -526,35 +546,82 @@ export default function Jobs({ user }) {
       </AnimatePresence>
 
       {/* LIST */}
-      <div className="bg-white shadow-sm ring-1 ring-gray-200 rounded-2xl overflow-hidden flex flex-col min-h-[500px] transition-all">
-        {(loading || isProcessing) && jobs.length === 0 ? (
+      <div className="relative bg-white shadow-sm ring-1 ring-gray-200 rounded-2xl overflow-hidden flex flex-col min-h-[500px] transition-all">
+        {/* Shimmer overlay */}
+        <AnimatePresence>
+          {isProcessing && jobs.length > 0 && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              className="absolute inset-0 z-10 pointer-events-none"
+            >
+              <div className="absolute inset-0 bg-white/55" />
+              <div className="absolute inset-0 animate-pulse">
+                <div className="h-16 border-b border-gray-100 bg-gray-50/70" />
+                <div className="h-16 border-b border-gray-100 bg-gray-50/60" />
+                <div className="h-16 border-b border-gray-100 bg-gray-50/70" />
+                <div className="h-16 border-b border-gray-100 bg-gray-50/60" />
+                <div className="h-16 border-b border-gray-100 bg-gray-50/70" />
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {loading && jobs.length === 0 ? (
           <div className="flex-grow divide-y divide-gray-100">
             {Array.from({ length: 6 }).map((_, i) => (
               <React.Fragment key={i}>{renderSkeleton()}</React.Fragment>
             ))}
           </div>
         ) : filteredJobs.length === 0 ? (
-          <div className="flex-grow flex flex-col items-center justify-center py-32 text-center bg-gray-50/10">
-            <p className="text-sm font-semibold text-gray-900 tracking-tight">No positions found</p>
-            <p className="text-xs text-gray-400 mt-1 max-w-[200px] leading-relaxed">Adjust filters to see more roles.</p>
+          <div className="flex-grow flex flex-col items-center justify-center py-32 text-center bg-gray-50/10 px-6">
+            <p className="text-sm font-semibold text-gray-900 tracking-tight">No roles match your filters</p>
+            <p className="text-xs text-gray-400 mt-1 max-w-[320px] leading-relaxed">
+              Try clearing filters or switching back to All Jobs.
+            </p>
+
+            <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
+              <button
+                onClick={() => setTimeframe("all")}
+                className="px-4 py-2 rounded-xl text-xs font-bold bg-white ring-1 ring-gray-200 text-gray-700 hover:bg-gray-50"
+              >
+                All Jobs
+              </button>
+              <button
+                onClick={resetAll}
+                className="px-4 py-2 rounded-xl text-xs font-bold bg-indigo-600 text-white hover:bg-indigo-700"
+              >
+                Clear filters
+              </button>
+            </div>
           </div>
         ) : (
           <div className="flex-grow">
-            {bookmarkedJobs.length > 0 && (
+            {/* ✅ Always show pinned section when showPinnedSeparately is true */}
+            {showPinnedSeparately && bookmarkedJobs.length > 0 && (
               <div className="bg-amber-50/30">
                 <div className="px-6 py-3 border-b border-amber-100/50 flex items-center gap-2">
-                  <span className="text-[10px] font-black uppercase tracking-widest text-amber-700">📌 Pinned for Review</span>
+                  <span className="text-[10px] font-black uppercase tracking-widest text-amber-700">
+                    📌 Saved for Review
+                  </span>
                 </div>
-                <ul className="divide-y divide-gray-100">
-                  {bookmarkedJobs.map((job) => renderJobItem(job))}
-                </ul>
-                <div className="relative py-4 bg-white flex items-center px-6">
-                  <div className="flex-grow border-t border-dashed border-gray-200" />
-                  <span className="flex-shrink mx-4 text-[10px] font-black text-gray-300 uppercase tracking-widest">Recent Postings</span>
-                  <div className="flex-grow border-t border-dashed border-gray-200" />
-                </div>
+                <ul className="divide-y divide-gray-100">{bookmarkedJobs.map((job) => renderJobItem(job))}</ul>
+
+                {/* Only show divider if there are also regular jobs */}
+                {regularJobs.length > 0 && (
+                  <div className="relative py-4 bg-white flex items-center px-6">
+                    <div className="flex-grow border-t border-dashed border-gray-200" />
+                    <span className="flex-shrink mx-4 text-[10px] font-black text-gray-300 uppercase tracking-widest">
+                      Recent Postings
+                    </span>
+                    <div className="flex-grow border-t border-dashed border-gray-200" />
+                  </div>
+                )}
               </div>
             )}
+
             <ul className="divide-y divide-gray-100">
               {regularJobs.map((job) => renderJobItem(job))}
             </ul>
@@ -562,7 +629,13 @@ export default function Jobs({ user }) {
         )}
 
         {/* Sentinel */}
-        <div ref={lastElementRef} className="h-20 flex items-center justify-center border-t border-gray-50">
+        <div ref={lastElementRef} className="h-20 flex flex-col items-center justify-center border-t border-gray-50 gap-1">
+          {jobs.length > 0 && (
+            <span className="text-[10px] font-black text-gray-300 uppercase tracking-widest">
+              {progressLabel}
+            </span>
+          )}
+
           {(loading || isProcessing) && jobs.length > 0 ? (
             <div className="flex gap-1.5">
               <div className="w-1.5 h-1.5 bg-indigo-600 rounded-full animate-bounce [animation-delay:-0.3s]" />

@@ -35,6 +35,11 @@ function fmtDuration(ms) {
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
+function pickRunTime(r) {
+  // New schema uses startedAt, but for "enqueued" runs startedAt may not exist yet.
+  return r.startedAt || r.enqueuedAt || r.createdAt || r.updatedAt || null;
+}
+
 export default function FetchHistory({ user }) {
   const [runs, setRuns] = useState([]);
   const [openId, setOpenId] = useState(null);
@@ -42,7 +47,13 @@ export default function FetchHistory({ user }) {
   useEffect(() => {
     if (!user?.uid) return;
     const ref = collection(db, "users", user.uid, "fetchRuns");
-    const q = query(ref, orderBy("startedAt", "desc"), limit(50));
+
+    // IMPORTANT:
+    // Your new backend creates fetchRuns with createdAt/enqueuedAt immediately,
+    // and sets startedAt later when the task actually begins.
+    // Ordering by createdAt is the most reliable and matches “recent runs”.
+    const q = query(ref, orderBy("createdAt", "desc"), limit(50));
+
     return onSnapshot(q, (snap) => {
       setRuns(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
     });
@@ -83,19 +94,16 @@ export default function FetchHistory({ user }) {
                 ? "text-amber-700"
                 : status === "DONE_WITH_ERRORS"
                 ? "text-red-700"
+                : status === "FAILED" || status === "ENQUEUE_FAILED"
+                ? "text-red-700"
                 : "text-gray-500";
 
+            const runTime = pickRunTime(r);
+
             const feedsCount = r.feedsCount ?? 0;
-            const processedCount = r.processed ?? r.processedCount ?? 0;
-            const totalNew = r.newCount ?? r.totalNew ?? 0;
-
-            const perFeed = Array.isArray(r.perFeedSummary)
-              ? r.perFeedSummary
-              : Array.isArray(r.results)
-              ? r.results
-              : [];
-
-            const errorSamples = Array.isArray(r.errorSamples) ? r.errorSamples : [];
+            const processedCount = r.processed ?? 0;
+            const totalNew = r.newCount ?? 0;
+            const errorsCount = r.errorsCount ?? 0;
 
             return (
               <li key={r.id} className="px-4 py-5 sm:px-6 hover:bg-gray-50 transition-colors">
@@ -110,12 +118,12 @@ export default function FetchHistory({ user }) {
                       </span>
 
                       <span className="text-sm font-semibold text-gray-900">
-                        Ran {fmtSince(r.startedAt)}
+                        Ran {fmtSince(runTime)}
                       </span>
 
                       <span className="text-gray-300">|</span>
 
-                      <span className="text-sm text-gray-600">{fmtDateTime(r.startedAt)}</span>
+                      <span className="text-sm text-gray-600">{fmtDateTime(runTime)}</span>
 
                       <span className="text-gray-300">|</span>
 
@@ -132,83 +140,55 @@ export default function FetchHistory({ user }) {
                       <span className="font-semibold">{fmtDuration(r.durationMs)}</span>
                     </div>
 
-                    {/* Expanded content */}
+                    {/* Expanded content (NO per-feed, NO error samples) */}
                     {isOpen && (
                       <div className="mt-5 space-y-4">
-                        {/* Errors */}
-                        {errorSamples.length === 0 ? (
+                        {status === "RUNNING" || status === "ENQUEUED" ? (
+                          <div className="rounded-lg bg-amber-50 ring-1 ring-inset ring-amber-100 p-4">
+                            <div className="text-xs font-bold uppercase tracking-widest text-amber-700">
+                              In progress
+                            </div>
+                            <div className="mt-2 text-sm text-amber-800">
+                              This run is still updating. Processed and Total new will increase while it runs.
+                            </div>
+                          </div>
+                        ) : errorsCount === 0 && status !== "FAILED" && status !== "ENQUEUE_FAILED" ? (
                           <div className="rounded-lg bg-green-50 ring-1 ring-inset ring-green-100 p-4">
                             <div className="text-xs font-bold uppercase tracking-widest text-green-700">
                               No errors in this run
                             </div>
                             <div className="mt-2 text-sm text-green-800">
-                              All feeds polled successfully.
+                              All feeds completed successfully.
                             </div>
                           </div>
                         ) : (
                           <div className="rounded-lg bg-red-50 ring-1 ring-inset ring-red-100 p-4">
                             <div className="text-xs font-bold uppercase tracking-widest text-red-700">
-                              Error samples
+                              Errors detected
                             </div>
-                            <ul className="mt-3 space-y-3">
-                              {errorSamples.map((e, idx) => (
-                                <li key={idx} className="text-sm">
-                                  <div className="text-xs text-gray-500 font-mono truncate">{e.url}</div>
-                                  <div className="text-sm text-red-800 mt-1">{e.message}</div>
-                                </li>
-                              ))}
-                            </ul>
-                          </div>
-                        )}
-
-                        {/* Per-feed summary */}
-                        {perFeed.length > 0 && (
-                          <div className="rounded-xl bg-white ring-1 ring-gray-200 p-4">
-                            <div className="text-xs font-black uppercase tracking-widest text-gray-500 mb-3">
-                              Per-feed summary
+                            <div className="mt-2 text-sm text-red-800">
+                              {status === "ENQUEUE_FAILED"
+                                ? "The run could not be enqueued."
+                                : status === "FAILED"
+                                ? "The task failed."
+                                : "Some feeds failed during the run."}
                             </div>
 
-                            <div className="space-y-3">
-                              {perFeed.map((x, idx) => {
-                                const name =
-                                  x.companyName ||
-                                  x.company ||
-                                  x.name ||
-                                  x.feedId;
-
-                                const ok = x.ok !== false && !x.error;
-                                const processed = x.kept ?? x.processed ?? 0;
-                                const newCount = x.newCount ?? 0;
-
-                                return (
-                                  <div key={idx} className="flex items-center justify-between gap-3">
-                                    <div className="min-w-0">
-                                      <div className="text-sm font-semibold text-gray-900 truncate">
-                                        {name}
-                                      </div>
-                                      {x.url ? (
-                                        <div className="text-[11px] text-gray-500 font-mono truncate">
-                                          {x.url}
-                                        </div>
-                                      ) : null}
-                                      {!ok && x.error ? (
-                                        <div className="text-xs text-red-700 mt-1 truncate">
-                                          {x.error}
-                                        </div>
-                                      ) : null}
-                                    </div>
-
-                                    <div
-                                      className={`text-xs font-bold whitespace-nowrap ${
-                                        ok ? "text-green-700" : "text-red-700"
-                                      }`}
-                                    >
-                                      {ok ? `+${newCount} new / ${processed} jobs` : "FAILED"}
-                                    </div>
-                                  </div>
-                                );
-                              })}
+                            <div className="mt-2 text-sm text-gray-700">
+                              Errors count: <span className="font-semibold">{errorsCount}</span>
                             </div>
+
+                            {r.enqueueError ? (
+                              <div className="mt-3 text-xs text-red-800 font-mono whitespace-pre-wrap break-words">
+                                {r.enqueueError}
+                              </div>
+                            ) : null}
+
+                            {r.error ? (
+                              <div className="mt-3 text-xs text-red-800 font-mono whitespace-pre-wrap break-words">
+                                {r.error}
+                              </div>
+                            ) : null}
                           </div>
                         )}
                       </div>
@@ -221,7 +201,7 @@ export default function FetchHistory({ user }) {
                     className={`text-xs font-bold uppercase tracking-wider ${
                       isOpen
                         ? "text-gray-600 hover:text-gray-900"
-                        : (r.errorsCount || 0) > 0
+                        : (errorsCount || 0) > 0 || status === "FAILED" || status === "ENQUEUE_FAILED"
                         ? "text-red-600 hover:text-red-800"
                         : "text-indigo-600 hover:text-indigo-800"
                     }`}
