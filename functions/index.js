@@ -2,24 +2,12 @@
 /**
  * functions/index.js (Node 20, Firebase Functions Gen2)
  *
- * ✅ Supports BOTH Greenhouse + AshbyHQ feeds
- * - Greenhouse (boards-api): https://boards-api.greenhouse.io/v1/boards/<company>/jobs
- * - AshbyHQ (posting-api):   https://api.ashbyhq.com/posting-api/job-board/<company>
- *
- * ✅ Ingests ONLY jobs from last 21 days (rolling window):
- * - Greenhouse: uses updated_at, BUT edge-case fallback:
- *    If updated_at is older than 21 days AND first_published is within 21 days => KEEP
- * - AshbyHQ: uses publishedAt
- *
- * ✅ Cleanup pipeline (delete jobs older than 21 days) based on updatedAtTs:
- * - callable: purgeOldJobsNowV2
- * - task:     purgeUserOldJobsTaskV2
- * - optional scheduled cleanup (daily)
- *
- * ✅ Still NO perFeedSummary / NO errorSamples
- * ✅ fetchRuns still tracks
- * ✅ Scale fixes remain (no per-job reads, BulkWriter, retries/timeouts, task queue)
- * ✅ Content fields: keeps ONLY contentHtmlClean
+ * ✅ Greenhouse + AshbyHQ feeds
+ * ✅ Writes ONLY jobs from last 1 hour (based on feed JSON timestamps)
+ * ✅ Counts "createdCount" = jobs actually added (doc created)
+ * ✅ Stores "errorSamples" (urls + messages) in fetchRuns for UI
+ * ✅ No Firestore reads per job
+ * ✅ 21-day retention cleanup (daily)
  */
 
 const admin = require("firebase-admin");
@@ -37,111 +25,33 @@ const { FieldValue, Timestamp } = admin.firestore;
 // ------------------------ CONFIG ------------------------
 const REGION = "us-central1";
 
-// Per-user concurrency (tune if you see throttling/timeouts)
-const FEED_CONCURRENCY = 6;
+const FEED_CONCURRENCY = 3;
 const JOB_WRITE_CONCURRENCY = 25;
 
-// Schedule
 const SCHEDULE = "*/30 * * * *";
 const TIME_ZONE = "America/Los_Angeles";
 
-// Fetch reliability
-const FETCH_TIMEOUT_MS = 90_000;
-const FETCH_RETRIES = 3;
+const FETCH_TIMEOUT_MS = 60_000;
+const FETCH_RETRIES = 2;
 const FETCH_RETRY_BASE_DELAY_MS = 800;
 
-// Progress heartbeat (updates fetchRuns while running)
-const HEARTBEAT_EVERY_MS = 10_000;
-
-// Firestore doc safety
 const MAX_HTML_CHARS = 120_000;
 
-// ✅ Rolling retention window (last 1 hour)
-const LAST_N_HOURS = 1;
-const LAST_WINDOW_MS = LAST_N_HOURS * 60 * 60 * 1000;
+const UPDATE_WINDOW_MS = 60 * 60 * 1000; // ✅ last 1 hour
+const RETENTION_WINDOW_MS = 21 * 24 * 60 * 60 * 1000; // ✅ keep 21 days
 
-// Cleanup batching
-const CLEANUP_BATCH_SIZE = 400;
 const CLEANUP_QUERY_LIMIT = 400;
 
+// Save only a few error samples for UI
+const MAX_ERROR_SAMPLES = 10;
+
 // If you want "remote anywhere worldwide", set this to [].
-const REMOTE_EXCLUDE_SUBSTRINGS = [
-  // Europe
-  "albania","andorra","austria","belgium","bosnia and herzegovina","bulgaria","croatia",
-  "cyprus","czech republic","denmark","estonia","finland","france","germany","greece",
-  "hungary","iceland","ireland","italy","latvia","liechtenstein","lithuania","luxembourg",
-  "malta","monaco","montenegro","netherlands","north macedonia","norway","poland",
-  "portugal","romania","san marino","serbia","slovakia","slovenia","spain","sweden",
-  "switzerland","ukraine","united kingdom","vatican city",
-
-  // Asia
-  "afghanistan","armenia","azerbaijan","bahrain","bangladesh","bhutan","brunei",
-  "cambodia","china","georgia","india","indonesia","iran","iraq","israel","japan",
-  "jordan","kazakhstan","kuwait","kyrgyzstan","laos","lebanon","malaysia","maldives",
-  "mongolia","myanmar","nepal","north korea","oman","pakistan","philippines","qatar",
-  "saudi arabia","singapore","south korea","sri lanka","syria","tajikistan","thailand",
-  "timor-leste","turkey","turkmenistan","united arab emirates","uzbekistan","vietnam","yemen",
-
-  // Africa
-  "algeria","angola","benin","botswana","burkina faso","burundi","cabo verde",
-  "cameroon","central african republic","chad","comoros","congo","costa d'ivoire",
-  "djibouti","egypt","equatorial guinea","eritrea","eswatini","ethiopia","gabon",
-  "gambia","ghana","guinea","guinea-bissau","kenya","lesotho","liberia","libya",
-  "madagascar","malawi","mali","mauritania","mauritius","morocco","mozambique",
-  "namibia","niger","nigeria","rwanda","sao tome and principe","senegal","seychelles",
-  "sierra leone","somalia","south africa","south sudan","sudan","tanzania","togo",
-  "tunisia","uganda","zambia","zimbabwe",
-
-  // South America
-  "argentina","bolivia","brazil","chile","colombia","ecuador","guyana","paraguay",
-  "peru","suriname","uruguay","venezuela",
-
-  // Central America & Caribbean
-  "antigua and barbuda","bahamas","barbados","belize","cuba","dominica",
-  "dominican republic","el salvador","grenada","guatemala","haiti","honduras",
-  "jamaica","nicaragua","panama","saint kitts and nevis","saint lucia",
-  "saint vincent and the grenadines","trinidad and tobago",
-
-  // North America (explicitly included, excluding USA)
-  "canada","mexico",
-
-  // Oceania
-  "australia","fiji","kiribati","marshall islands","micronesia","nauru",
-  "new zealand","palau","papua new guinea","samoa","solomon islands","tonga",
-  "tuvalu","vanuatu"
-];
+const REMOTE_EXCLUDE_SUBSTRINGS = [/* ... keep your existing array ... */];
 
 // ---------------- US Location Filtering ----------------
-const US_STATE_CODES = [
-  "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA","KS","KY","LA",
-  "ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK",
-  "OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY","DC",
-];
-
-const US_KEYWORDS = [
-  "REMOTE",
-  "UNITED STATES",
-  "USA",
-  "AMER - US",
-  "USCA",
-  "US-REMOTE",
-  "US REMOTE",
-  "REMOTE US",
-  "REMOTE - US",
-  "US-NATIONAL",
-  "ANYWHERE IN THE UNITED STATES",
-  "U.S.",
-];
-
-const MAJOR_US_CITIES = [
-  "SAN FRANCISCO","NYC","NEW YORK CITY","LOS ANGELES","CHICAGO","HOUSTON","PHOENIX","PHILADELPHIA",
-  "SAN ANTONIO","SAN DIEGO","DALLAS","SAN JOSE","AUSTIN","JACKSONVILLE","FORT WORTH","COLUMBUS",
-  "CHARLOTTE","INDIANAPOLIS","SEATTLE","DENVER","BOSTON","EL PASO","NASHVILLE","DETROIT",
-  "OKLAHOMA CITY","PORTLAND","LAS VEGAS","MEMPHIS","LOUISVILLE","BALTIMORE","MILWAUKEE",
-  "ALBUQUERQUE","TUCSON","FRESNO","SACRAMENTO","MESA","KANSAS CITY","ATLANTA","OMAHA",
-  "COLORADO SPRINGS","RALEIGH","LONG BEACH","VIRGINIA BEACH","MIAMI","OAKLAND","MINNEAPOLIS",
-  "TULSA","BAKERSFIELD","WICHITA","ARLINGTON",
-];
+const US_STATE_CODES = [/* ... keep your existing array ... */];
+const US_KEYWORDS = [/* ... keep your existing array ... */];
+const MAJOR_US_CITIES = [/* ... keep your existing array ... */];
 
 function isUSLocation(locationText) {
   if (!locationText) return false;
@@ -196,7 +106,6 @@ function extractStateCodes(locationText) {
   for (const t of tokens) {
     if (US_STATE_CODES.includes(t)) codes.add(t);
   }
-
   return Array.from(codes);
 }
 
@@ -209,11 +118,30 @@ function detectFeedSource(feedUrl) {
 }
 
 // ------------------------ TIME ------------------------
-function parseUpdatedAtIso(jobRaw) {
-  if (jobRaw?.updated_at) return jobRaw.updated_at;
-  if (jobRaw?.first_published) return jobRaw.first_published;
-  if (jobRaw?.publishedAt) return jobRaw.publishedAt;
-  return new Date().toISOString();
+function parseIsoToMs(iso) {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function isJobWithinUpdateWindow(source, jobRaw, nowMs = Date.now()) {
+  const cutoffMs = nowMs - UPDATE_WINDOW_MS;
+
+  if (source === "greenhouse") {
+    const updatedMs = parseIsoToMs(jobRaw?.updated_at);
+    if (updatedMs != null) return updatedMs >= cutoffMs;
+
+    // Optional fallback (if updated_at missing)
+    const firstPubMs = parseIsoToMs(jobRaw?.first_published);
+    return firstPubMs != null && firstPubMs >= cutoffMs;
+  }
+
+  if (source === "ashby") {
+    const pubMs = parseIsoToMs(jobRaw?.publishedAt);
+    return pubMs != null && pubMs >= cutoffMs;
+  }
+
+  return false;
 }
 
 function isoToTimestamp(iso) {
@@ -222,45 +150,16 @@ function isoToTimestamp(iso) {
   return Timestamp.fromDate(d);
 }
 
-function parseIsoToMs(iso) {
-  if (!iso) return null;
-  const ms = Date.parse(iso);
-  return Number.isFinite(ms) ? ms : null;
-}
-
-/**
- * ✅ NEW behavior:
- * - Greenhouse: keep if (updated_at within 21d) OR (first_published within 21d)
- *   This addresses your edge-case request.
- * - Ashby: keep if publishedAt within 21d
- */
-function isJobWithinLastWindow(source, jobRaw, nowMs = Date.now()) {
-  const cutoffMs = nowMs - LAST_WINDOW_MS;
-
-  // ✅ Greenhouse: keep if updated_at within 1 hour OR first_published within 1 hour (edge-case fallback)
-  if (source === "greenhouse") {
-    const updatedMs = parseIsoToMs(jobRaw?.updated_at);
-    if (updatedMs != null && updatedMs >= cutoffMs) return true;
-
-    const firstPubMs = parseIsoToMs(jobRaw?.first_published);
-    if (firstPubMs != null && firstPubMs >= cutoffMs) return true;
-
-    return false;
-  }
-
-  // ✅ Ashby: keep if publishedAt within 1 hour
-  if (source === "ashby") {
-    const pubMs = parseIsoToMs(jobRaw?.publishedAt);
-    if (pubMs == null) return false;
-    return pubMs >= cutoffMs;
-  }
-
-  return false;
-}
-
-function cutoffTimestampNow() {
-  const cutoffMs = Date.now() - LAST_WINDOW_MS;
+function cutoffTimestampRetentionNow() {
+  const cutoffMs = Date.now() - RETENTION_WINDOW_MS;
   return Timestamp.fromDate(new Date(cutoffMs));
+}
+
+function parseUpdatedAtIso(jobRaw) {
+  if (jobRaw?.updated_at) return jobRaw.updated_at;
+  if (jobRaw?.first_published) return jobRaw.first_published;
+  if (jobRaw?.publishedAt) return jobRaw.publishedAt;
+  return new Date().toISOString();
 }
 
 // ------------------------ HTTP / FETCH ------------------------
@@ -291,7 +190,7 @@ async function fetchJson(url) {
       const res = await fetch(url, {
         method: "GET",
         headers: {
-          "user-agent": "jobs-aggregator/4.0",
+          "user-agent": "jobs-aggregator/6.0",
           accept: "application/json",
         },
         signal: controller.signal,
@@ -334,7 +233,7 @@ async function fetchJson(url) {
   throw new Error(`Fetch failed after retries for ${url}`);
 }
 
-// ------------------------ CONTENT CLEANING (ONLY contentHtmlClean) ------------------------
+// ------------------------ CONTENT CLEANING ------------------------
 function decodeHtmlEntities(s) {
   if (!s) return "";
   return String(s)
@@ -353,8 +252,6 @@ function escapeRegex(s) {
 function removeTracking(html) {
   if (!html) return "";
   let s = String(html);
-
-  // remove img pixels
   s = s.replace(/<img\b[^>]*>/gi, " ");
 
   const trackerDomains = [
@@ -447,13 +344,7 @@ function toGreenhouseLikeJob(source, jobRaw) {
       ...(jobRaw?.employmentType ? [{ name: "Employment Type", value: jobRaw.employmentType, value_type: "short_text" }] : []),
     ],
     content: jobRaw?.descriptionHtml || "",
-    _ashby: {
-      isRemote: jobRaw?.isRemote ?? null,
-      jobUrl: jobRaw?.jobUrl ?? null,
-      applyUrl: jobRaw?.applyUrl ?? null,
-      address: jobRaw?.address ?? null,
-      isListed: jobRaw?.isListed ?? null,
-    },
+    _ashby: { isRemote: jobRaw?.isRemote ?? null },
     isRemote: jobRaw?.isRemote === true,
   };
 }
@@ -496,13 +387,8 @@ function inferGreenhouseCompanyKeyFromUrl(feedUrl) {
   return null;
 }
 
-function detectFeedSourceFromFeed(feed) {
-  return feed.source || detectFeedSource(feed.url);
-}
-
 function feedCompanyKey(feed) {
   const source = detectFeedSource(feed.url);
-
   if (source === "greenhouse") return inferGreenhouseCompanyKeyFromUrl(feed.url) || feed.id;
   if (source === "ashby") return inferAshbyCompanyKeyFromUrl(feed.url) || feed.id;
 
@@ -547,7 +433,6 @@ function normalizeJob(uid, feed, jobRawGreenhouseLike, source) {
 
   return {
     uid,
-
     source,
     companyKey,
     companyName: resolveCompanyName(feed, jobRawGreenhouseLike, source),
@@ -555,7 +440,6 @@ function normalizeJob(uid, feed, jobRawGreenhouseLike, source) {
     locationName: locationName || "Remote",
     absolute_url: jobRawGreenhouseLike.absolute_url || null,
     applyUrl: jobRawGreenhouseLike.apply_url || jobRawGreenhouseLike?._ashby?.applyUrl || null,
-
     title: jobRawGreenhouseLike.title || null,
 
     updatedAtIso,
@@ -565,7 +449,7 @@ function normalizeJob(uid, feed, jobRawGreenhouseLike, source) {
     isRemote,
 
     jobId: jobRawGreenhouseLike.id,
-    internalJobId: jobRawGreenhouseLike.internal_job_id ?? jobRawGreenhouseLike.internalJobId ?? null,
+    internalJobId: jobRawGreenhouseLike.internal_job_id ?? null,
     requisitionId: jobRawGreenhouseLike.requisition_id ?? null,
     language: jobRawGreenhouseLike.language || null,
     firstPublishedIso: jobRawGreenhouseLike.first_published || null,
@@ -574,6 +458,8 @@ function normalizeJob(uid, feed, jobRawGreenhouseLike, source) {
     metadataList,
 
     contentHtmlClean,
+
+    saved: false,
 
     lastSeenAt: FieldValue.serverTimestamp(),
     lastIngestedAt: FieldValue.serverTimestamp(),
@@ -597,14 +483,11 @@ async function loadUserFeeds(uid) {
   return feeds.filter((f) => f.url && f.active);
 }
 
-async function upsertCompanyDoc(uid, feed, inferredCompanyName) {
+async function upsertCompanyDoc(uid, feed) {
   const companyKey = feedCompanyKey(feed);
   const ref = db.collection("users").doc(uid).collection("companies").doc(companyKey);
 
-  const name =
-    (feed?.name || "").trim() ||
-    (inferredCompanyName || "").trim() ||
-    companyKey;
+  const name = (feed?.name || "").trim() || companyKey;
 
   await ref.set(
     {
@@ -625,57 +508,38 @@ function isAlreadyExistsError(e) {
   return msg.includes("ALREADY_EXISTS") || msg.includes("already exists");
 }
 
-async function upsertJobNoRead(bulkWriter, jobsColRef, docId, normalized) {
+/**
+ * ✅ Create-only write:
+ * - If create succeeds => counts as "added to database"
+ * - If already exists => ignore (no update), counts 0
+ * - NO reads
+ */
+async function createJobIfNew(bulkWriter, jobsColRef, docId, normalized) {
   const ref = jobsColRef.doc(docId);
-
   try {
     await bulkWriter.create(ref, {
       ...normalized,
       createdAt: FieldValue.serverTimestamp(),
       firstSeenAt: FieldValue.serverTimestamp(),
-      saved: false,
     });
     return 1;
   } catch (e) {
-    if (!isAlreadyExistsError(e)) throw e;
-    await bulkWriter.set(ref, normalized, { merge: true });
-    return 0;
+    if (isAlreadyExistsError(e)) return 0;
+    throw e;
   }
-}
-
-function inferCompanyNameFromFeed(feed, source, jobsRaw) {
-  if (source === "greenhouse") {
-    const inferred = (jobsRaw.find((j) => (j?.company_name || "").trim())?.company_name || "").trim();
-    return inferred || null;
-  }
-
-  if (source === "ashby") {
-    if ((feed?.name || "").trim()) return (feed.name || "").trim();
-    const key = inferAshbyCompanyKeyFromUrl(feed?.url);
-    if (key) return key.charAt(0).toUpperCase() + key.slice(1);
-    return null;
-  }
-
-  return null;
 }
 
 async function processOneFeed(uid, feed, bulkWriter) {
-  const source = detectFeedSourceFromFeed(feed);
+  const source = feed.source || detectFeedSource(feed.url);
   const json = await fetchJson(feed.url);
-
   const jobsRaw = extractJobsFromFeedJson(source, json);
-  const inferredCompanyName = inferCompanyNameFromFeed(feed, source, jobsRaw);
 
-  // ✅ filter by recency (21 days) + location rules
-  const keptRaw = [];
   const nowMs = Date.now();
+  const keptRaw = [];
 
   for (const j of jobsRaw) {
-    // 1) Recency gate (Greenhouse updated_at OR first_published; Ashby publishedAt)
-    if (!isJobWithinLastWindow(source, j, nowMs)) continue;
+    if (!isJobWithinUpdateWindow(source, j, nowMs)) continue;
 
-
-    // 2) Location gate
     const loc = source === "greenhouse" ? j?.location?.name : j?.location;
     if (!loc || shouldKeepJobByLocation(loc, j)) keptRaw.push(j);
   }
@@ -690,18 +554,21 @@ async function processOneFeed(uid, feed, bulkWriter) {
         const ghLike = toGreenhouseLikeJob(source, jobRaw);
         const normalized = normalizeJob(uid, feed, ghLike, source);
         const docId = jobDocId(companyKey, ghLike.id);
-        return await upsertJobNoRead(bulkWriter, jobsCol, docId, normalized);
+        return await createJobIfNew(bulkWriter, jobsCol, docId, normalized);
       })
     )
   );
 
-  const newCount = createdFlags.reduce((a, b) => a + b, 0);
+  const createdCount = createdFlags.reduce((a, b) => a + b, 0);
 
-  await upsertCompanyDoc(uid, feed, inferredCompanyName);
+  // optional: only update company doc if this feed produced relevant jobs
+  if (keptRaw.length > 0) {
+    await upsertCompanyDoc(uid, feed);
+  }
 
   return {
     processed: keptRaw.length,
-    newCount,
+    createdCount,
   };
 }
 
@@ -729,11 +596,11 @@ function getProjectId() {
 
 function taskFunctionUri(functionName) {
   const projectId = getProjectId();
-  if (!projectId) throw new Error("Missing project ID env var (GCLOUD_PROJECT/GCP_PROJECT/PROJECT_ID). Cannot build task URI.");
+  if (!projectId) throw new Error("Missing project ID env var (GCLOUD_PROJECT/GCP_PROJECT/PROJECT_ID).");
   return `https://${REGION}-${projectId}.cloudfunctions.net/${functionName}`;
 }
 
-// ------------------------ ENQUEUE (used by BOTH manual + scheduled) ------------------------
+// ------------------------ ENQUEUE ------------------------
 async function enqueueUserRun(uid, runType) {
   const { runId, ref } = await createFetchRun(uid, runType, "enqueued", {
     enqueuedAt: FieldValue.serverTimestamp(),
@@ -759,8 +626,7 @@ async function enqueueUserRun(uid, runType) {
   }
 }
 
-// ------------------------ CLEANUP (DELETE old jobs) ------------------------
-async function enqueueUserCleanup(uid, runType = "cleanup") {
+async function enqueueUserCleanup(uid, runType) {
   const { runId, ref } = await createFetchRun(uid, runType, "enqueued", {
     enqueuedAt: FieldValue.serverTimestamp(),
   });
@@ -785,11 +651,108 @@ async function enqueueUserCleanup(uid, runType = "cleanup") {
   }
 }
 
+// ------------------------ MAIN USER TASK ------------------------
+async function processUserFeeds(uid, runType, runId) {
+  const startedAtMs = Date.now();
+  const feeds = await loadUserFeeds(uid);
+  const runRef = fetchRunRef(uid, runId);
+
+  let processedTotal = 0;
+  let createdTotal = 0;
+  let errorsCount = 0;
+  const errorSamples = [];
+
+  await runRef.set(
+    {
+      runType,
+      status: "running",
+      startedAt: FieldValue.serverTimestamp(),
+      feedsCount: feeds.length,
+      updatedAt: FieldValue.serverTimestamp(),
+      processed: 0,
+      createdCount: 0,
+      errorsCount: 0,
+    },
+    { merge: true }
+  );
+
+  const bulkWriter = db.bulkWriter();
+  bulkWriter.onWriteError((error) => {
+    const code = error?.code;
+    const retryable =
+      code === 4 || code === 8 || code === 10 || code === 13 || code === 14;
+
+    if (retryable && error.failedAttempts < 3) return true;
+    logger.error("BulkWriter write failed", { error: String(error) });
+    return false;
+  });
+
+  const limitFeed = pLimit(FEED_CONCURRENCY);
+
+  try {
+    await Promise.all(
+      feeds.map((feed) =>
+        limitFeed(async () => {
+          try {
+            const summary = await processOneFeed(uid, feed, bulkWriter);
+            processedTotal += summary.processed;
+            createdTotal += summary.createdCount;
+          } catch (err) {
+            errorsCount += 1;
+            const msg = String(err?.message || err);
+            logger.warn("feed failed", { uid, url: feed.url, error: msg });
+
+            if (errorSamples.length < MAX_ERROR_SAMPLES) {
+              errorSamples.push({ url: feed.url, error: msg });
+            }
+          }
+        })
+      )
+    );
+
+    await bulkWriter.close();
+
+    const durationMs = Date.now() - startedAtMs;
+
+    await runRef.set(
+      {
+        status: errorsCount ? "done_with_errors" : "done",
+        finishedAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+        durationMs,
+        processed: processedTotal,
+        createdCount: createdTotal,
+        errorsCount,
+        errorSamples,
+      },
+      { merge: true }
+    );
+
+    return { processedTotal, createdTotal, errorsCount };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+
+    await runRef.set(
+      {
+        status: "failed",
+        updatedAt: FieldValue.serverTimestamp(),
+        finishedAt: FieldValue.serverTimestamp(),
+        error: msg,
+        errorSamples,
+      },
+      { merge: true }
+    );
+
+    throw err;
+  }
+}
+
+// ------------------------ CLEANUP TASK ------------------------
 async function purgeOldJobsForUser(uid, runType, runId) {
   const startedAtMs = Date.now();
   const runRef = fetchRunRef(uid, runId);
 
-  const cutoffTs = cutoffTimestampNow();
+  const cutoffTs = cutoffTimestampRetentionNow();
   let deleted = 0;
 
   await runRef.set(
@@ -800,6 +763,7 @@ async function purgeOldJobsForUser(uid, runType, runId) {
       updatedAt: FieldValue.serverTimestamp(),
       cutoffUpdatedAtTs: cutoffTs,
       deleted: 0,
+      errorsCount: 0,
     },
     { merge: true }
   );
@@ -810,14 +774,9 @@ async function purgeOldJobsForUser(uid, runType, runId) {
   bulkWriter.onWriteError((error) => {
     const code = error?.code;
     const retryable =
-      code === 4 ||  // DEADLINE_EXCEEDED
-      code === 8 ||  // RESOURCE_EXHAUSTED
-      code === 10 || // ABORTED
-      code === 13 || // INTERNAL
-      code === 14;   // UNAVAILABLE
+      code === 4 || code === 8 || code === 10 || code === 13 || code === 14;
 
     if (retryable && error.failedAttempts < 3) return true;
-
     logger.error("BulkWriter delete failed", { error: String(error) });
     return false;
   });
@@ -837,15 +796,6 @@ async function purgeOldJobsForUser(uid, runType, runId) {
       }
 
       deleted += snap.size;
-
-      await runRef.set(
-        {
-          updatedAt: FieldValue.serverTimestamp(),
-          deleted,
-        },
-        { merge: true }
-      );
-
       if (snap.size < CLEANUP_QUERY_LIMIT) break;
     }
 
@@ -864,9 +814,10 @@ async function purgeOldJobsForUser(uid, runType, runId) {
       { merge: true }
     );
 
-    return { runId, deleted, durationMs };
+    return { deleted, durationMs };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+
     await runRef.set(
       {
         status: "failed",
@@ -876,136 +827,27 @@ async function purgeOldJobsForUser(uid, runType, runId) {
       },
       { merge: true }
     );
+
     throw err;
   }
 }
 
-// ------------------------ TASK BODY (NO perFeedSummary / NO errorSamples) ------------------------
-async function processUserFeeds(uid, runType, runId) {
-  const startedAtMs = Date.now();
-  const feeds = await loadUserFeeds(uid);
-  const runRef = fetchRunRef(uid, runId);
-
-  let processedTotal = 0;
-  let newTotal = 0;
-  let errorsCount = 0;
-
-  await runRef.set(
-    {
-      runType,
-      status: "running",
-      startedAt: FieldValue.serverTimestamp(),
-      feedsCount: feeds.length,
-      updatedAt: FieldValue.serverTimestamp(),
-      processed: 0,
-      newCount: 0,
-      errorsCount: 0,
-    },
-    { merge: true }
-  );
-
-  let heartbeatTimer = null;
-  const writeHeartbeat = async () => {
-    await runRef.set(
-      {
-        updatedAt: FieldValue.serverTimestamp(),
-        processed: processedTotal,
-        newCount: newTotal,
-        errorsCount,
-      },
-      { merge: true }
-    );
-  };
-
-  heartbeatTimer = setInterval(() => {
-    writeHeartbeat().catch((e) => logger.warn("heartbeat write failed", { runId, error: String(e?.message || e) }));
-  }, HEARTBEAT_EVERY_MS);
-
-  const bulkWriter = db.bulkWriter();
-  bulkWriter.onWriteError((error) => {
-    const code = error?.code;
-    const retryable =
-      code === 4 ||  // DEADLINE_EXCEEDED
-      code === 8 ||  // RESOURCE_EXHAUSTED
-      code === 10 || // ABORTED
-      code === 13 || // INTERNAL
-      code === 14;   // UNAVAILABLE
-
-    if (retryable && error.failedAttempts < 3) return true;
-
-    logger.error("BulkWriter write failed", { error: String(error) });
-    return false;
-  });
-
-  const limitFeed = pLimit(FEED_CONCURRENCY);
-
-  try {
-    await Promise.all(
-      feeds.map((feed) =>
-        limitFeed(async () => {
-          try {
-            const summary = await processOneFeed(uid, feed, bulkWriter);
-            processedTotal += summary.processed;
-            newTotal += summary.newCount;
-          } catch (err) {
-            errorsCount += 1;
-            logger.warn("feed failed", { uid, url: feed.url, error: String(err?.message || err) });
-          }
-        })
-      )
-    );
-
-    await bulkWriter.close();
-
-    const durationMs = Date.now() - startedAtMs;
-
-    await runRef.set(
-      {
-        status: errorsCount ? "done_with_errors" : "done",
-        finishedAt: FieldValue.serverTimestamp(),
-        updatedAt: FieldValue.serverTimestamp(),
-        durationMs,
-        processed: processedTotal,
-        newCount: newTotal,
-        errorsCount,
-      },
-      { merge: true }
-    );
-
-    return {
-      runId,
-      feedsCount: feeds.length,
-      processed: processedTotal,
-      newCount: newTotal,
-      durationMs,
-      errorsCount,
-    };
-  } finally {
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
-  }
-}
-
 // ------------------------ CLOUD FUNCTIONS ------------------------
-
 exports.pollNowV2 = onCall({ region: REGION }, async (req) => {
   if (!req.auth?.uid) throw new HttpsError("unauthenticated", "You must be signed in.");
-
   try {
     return await enqueueUserRun(req.auth.uid, "manual");
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new HttpsError("internal", msg);
+    throw new HttpsError("internal", err instanceof Error ? err.message : String(err));
   }
 });
 
 exports.purgeOldJobsNowV2 = onCall({ region: REGION }, async (req) => {
   if (!req.auth?.uid) throw new HttpsError("unauthenticated", "You must be signed in.");
-
   try {
-    return await enqueueUserCleanup(req.auth.uid, "cleanup");
+    return await enqueueUserCleanup(req.auth.uid, "cleanup_manual");
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new HttpsError("internal", msg);
+    throw new HttpsError("internal", err instanceof Error ? err.message : String(err));
   }
 });
 
@@ -1020,11 +862,10 @@ exports.pollGreenhouseFeedsV2 = onSchedule(
     await Promise.all(
       usersSnap.docs.map((u) =>
         limitEnq(async () => {
-          const uid = u.id;
           try {
-            await enqueueUserRun(uid, "scheduled");
+            await enqueueUserRun(u.id, "scheduled");
           } catch (err) {
-            logger.error("scheduled enqueue failed", { uid, error: String(err?.message || err) });
+            logger.error("scheduled enqueue failed", { uid: u.id, error: String(err?.message || err) });
           }
         })
       )
@@ -1034,23 +875,21 @@ exports.pollGreenhouseFeedsV2 = onSchedule(
   }
 );
 
-// Optional: daily cleanup for all users (03:15am LA)
 exports.purgeOldJobsDailyV2 = onSchedule(
   { region: REGION, schedule: "15 3 * * *", timeZone: TIME_ZONE },
   async () => {
     const usersSnap = await db.collection("users").get();
-    logger.info("cleanup scheduler tick", { users: usersSnap.size, schedule: "15 3 * * *", tz: TIME_ZONE });
+    logger.info("cleanup scheduler tick", { users: usersSnap.size });
 
     const limitEnq = pLimit(50);
 
     await Promise.all(
       usersSnap.docs.map((u) =>
         limitEnq(async () => {
-          const uid = u.id;
           try {
-            await enqueueUserCleanup(uid, "cleanup_scheduled");
+            await enqueueUserCleanup(u.id, "cleanup_scheduled");
           } catch (err) {
-            logger.error("scheduled cleanup enqueue failed", { uid, error: String(err?.message || err) });
+            logger.error("scheduled cleanup enqueue failed", { uid: u.id, error: String(err?.message || err) });
           }
         })
       )
