@@ -56,9 +56,9 @@ const HEARTBEAT_EVERY_MS = 10_000;
 // Firestore doc safety
 const MAX_HTML_CHARS = 120_000;
 
-// ✅ Rolling retention window
-const LAST_N_DAYS = 21;
-const LAST_N_DAYS_MS = LAST_N_DAYS * 24 * 60 * 60 * 1000;
+// ✅ Rolling retention window (last 1 hour)
+const LAST_N_HOURS = 1;
+const LAST_WINDOW_MS = LAST_N_HOURS * 60 * 60 * 1000;
 
 // Cleanup batching
 const CLEANUP_BATCH_SIZE = 400;
@@ -234,9 +234,10 @@ function parseIsoToMs(iso) {
  *   This addresses your edge-case request.
  * - Ashby: keep if publishedAt within 21d
  */
-function isJobWithinLastNDays(source, jobRaw, nowMs = Date.now()) {
-  const cutoffMs = nowMs - LAST_N_DAYS_MS;
+function isJobWithinLastWindow(source, jobRaw, nowMs = Date.now()) {
+  const cutoffMs = nowMs - LAST_WINDOW_MS;
 
+  // ✅ Greenhouse: keep if updated_at within 1 hour OR first_published within 1 hour (edge-case fallback)
   if (source === "greenhouse") {
     const updatedMs = parseIsoToMs(jobRaw?.updated_at);
     if (updatedMs != null && updatedMs >= cutoffMs) return true;
@@ -247,6 +248,7 @@ function isJobWithinLastNDays(source, jobRaw, nowMs = Date.now()) {
     return false;
   }
 
+  // ✅ Ashby: keep if publishedAt within 1 hour
   if (source === "ashby") {
     const pubMs = parseIsoToMs(jobRaw?.publishedAt);
     if (pubMs == null) return false;
@@ -257,7 +259,7 @@ function isJobWithinLastNDays(source, jobRaw, nowMs = Date.now()) {
 }
 
 function cutoffTimestampNow() {
-  const cutoffMs = Date.now() - LAST_N_DAYS_MS;
+  const cutoffMs = Date.now() - LAST_WINDOW_MS;
   return Timestamp.fromDate(new Date(cutoffMs));
 }
 
@@ -670,7 +672,8 @@ async function processOneFeed(uid, feed, bulkWriter) {
 
   for (const j of jobsRaw) {
     // 1) Recency gate (Greenhouse updated_at OR first_published; Ashby publishedAt)
-    if (!isJobWithinLastNDays(source, j, nowMs)) continue;
+    if (!isJobWithinLastWindow(source, j, nowMs)) continue;
+
 
     // 2) Location gate
     const loc = source === "greenhouse" ? j?.location?.name : j?.location;
