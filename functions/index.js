@@ -3,12 +3,13 @@
  * functions/index.js (Node 20, Firebase Functions Gen2)
  *
  * ✅ Supports BOTH Greenhouse + AshbyHQ feeds
+ * ✅ Only processes jobs updated within the last 1 hour (configurable)
  * ✅ Reduces Firestore writes by comparing timestamps BEFORE writing:
  *    - Added: doc doesn't exist -> create()
  *    - Updated: doc exists AND incomingUpdatedAtMs > existingUpdatedAtMs -> set(merge)
  *    - Skipped: doc exists AND incomingUpdatedAtMs <= existingUpdatedAtMs -> no write
  *
- * ✅ Upsert timestamp rules:
+ * ✅ Timestamp rules:
  *    - Greenhouse: max(updated_at, first_published)
  *    - AshbyHQ: publishedAt
  */
@@ -35,6 +36,9 @@ const JOB_WRITE_CONCURRENCY = 25;
 // Schedule
 const SCHEDULE = "*/30 * * * *";
 const TIME_ZONE = "America/Los_Angeles";
+
+// Process only jobs "updated" within last 1 hour
+const WINDOW_MS = 60 * 60 * 1000; // 1 hour
 
 // Fetch reliability
 const FETCH_TIMEOUT_MS = 90_000;
@@ -204,27 +208,29 @@ function isoToTimestamp(iso) {
 function isoToMs(iso) {
   const d = new Date(iso);
   const ms = d.getTime();
-  if (!Number.isFinite(ms)) return Date.now();
+  if (!Number.isFinite(ms)) return 0;
   return ms;
 }
 
 /**
- * ✅ Upsert timestamp rules (what we compare to decide whether to write)
- * - Greenhouse: use latest of updated_at and first_published
+ * ✅ Timestamp rules
+ * - Greenhouse: latest of updated_at + first_published
  * - Ashby: publishedAt
+ *
+ * IMPORTANT: For Ashby we must use the *original Ashby job object* (not _ashby shim).
  */
-function computeSourceUpdatedIso(source, jobRaw) {
+function computeSourceUpdatedIso(source, jobRawOriginal) {
   if (source === "ashby") {
-    return jobRaw?.publishedAt || new Date().toISOString();
+    return jobRawOriginal?.publishedAt || null;
   }
   // greenhouse-like
-  const a = jobRaw?.updated_at || null;
-  const b = jobRaw?.first_published || null;
+  const a = jobRawOriginal?.updated_at || null;
+  const b = jobRawOriginal?.first_published || null;
 
   if (a && b) {
     return isoToMs(a) >= isoToMs(b) ? a : b;
   }
-  return a || b || new Date().toISOString();
+  return a || b || null;
 }
 
 // ------------------------ HTTP / FETCH ------------------------
@@ -255,7 +261,7 @@ async function fetchJson(url) {
       const res = await fetch(url, {
         method: "GET",
         headers: {
-          "user-agent": "jobs-aggregator/5.0",
+          "user-agent": "jobs-aggregator/6.0",
           accept: "application/json",
         },
         signal: controller.signal,
@@ -298,7 +304,7 @@ async function fetchJson(url) {
   throw new Error(`Fetch failed after retries for ${url}`);
 }
 
-// ------------------------ CONTENT CLEANING (ONLY contentHtmlClean) ------------------------
+// ------------------------ CONTENT CLEANING ------------------------
 function decodeHtmlEntities(s) {
   if (!s) return "";
   return String(s)
@@ -393,6 +399,7 @@ function normalizeMetadata(metadataArr) {
 function toGreenhouseLikeJob(source, jobRaw) {
   if (source === "greenhouse") return jobRaw;
 
+  // ashby -> greenhouse-like
   return {
     id: jobRaw?.id,
     title: jobRaw?.title || null,
@@ -411,14 +418,15 @@ function toGreenhouseLikeJob(source, jobRaw) {
       ...(jobRaw?.employmentType ? [{ name: "Employment Type", value: jobRaw.employmentType, value_type: "short_text" }] : []),
     ],
     content: jobRaw?.descriptionHtml || "",
+    isRemote: jobRaw?.isRemote === true,
     _ashby: {
       isRemote: jobRaw?.isRemote ?? null,
       jobUrl: jobRaw?.jobUrl ?? null,
       applyUrl: jobRaw?.applyUrl ?? null,
       address: jobRaw?.address ?? null,
       isListed: jobRaw?.isListed ?? null,
+      publishedAt: jobRaw?.publishedAt ?? null,
     },
-    isRemote: jobRaw?.isRemote === true,
   };
 }
 
@@ -482,11 +490,11 @@ function feedCompanyKey(feed) {
   }
 }
 
-function resolveCompanyName(feed, jobRaw, source) {
+function resolveCompanyName(feed, jobRawGreenhouseLike, source) {
   const fromFeed = (feed?.name || "").trim();
   if (fromFeed) return fromFeed;
 
-  const fromJob = (jobRaw?.company_name || "").trim();
+  const fromJob = (jobRawGreenhouseLike?.company_name || "").trim();
   if (fromJob) return fromJob;
 
   if (source === "ashby") {
@@ -498,15 +506,15 @@ function resolveCompanyName(feed, jobRaw, source) {
 }
 
 /**
- * normalizeJob now includes:
- * - sourceUpdatedIso/sourceUpdatedTs/sourceUpdatedMs
- * This is what we compare in Firestore to decide if we need to write.
+ * normalizeJob includes:
+ * - sourceUpdatedIso/sourceUpdatedTs/sourceUpdatedMs (computed from ORIGINAL job object)
  */
-function normalizeJob(uid, feed, jobRawGreenhouseLike, source) {
+function normalizeJob(uid, feed, jobRawGreenhouseLike, source, sourceUpdatedIso) {
   const locationName = jobRawGreenhouseLike?.location?.name || "";
-  const sourceUpdatedIso = computeSourceUpdatedIso(source, source === "ashby" ? jobRawGreenhouseLike?._ashby : jobRawGreenhouseLike);
-  const sourceUpdatedTs = isoToTimestamp(sourceUpdatedIso);
-  const sourceUpdatedMs = isoToMs(sourceUpdatedIso);
+  const safeIso = sourceUpdatedIso || new Date().toISOString();
+
+  const sourceUpdatedTs = isoToTimestamp(safeIso);
+  const sourceUpdatedMs = isoToMs(safeIso);
 
   const { metadataKV, metadataList } = normalizeMetadata(jobRawGreenhouseLike.metadata);
   const contentHtmlClean = normalizeContentHtmlClean(jobRawGreenhouseLike.content || "");
@@ -531,8 +539,8 @@ function normalizeJob(uid, feed, jobRawGreenhouseLike, source) {
 
     title: jobRawGreenhouseLike.title || null,
 
-    // the "freshness" we compare
-    sourceUpdatedIso,
+    // freshness we compare (THIS drives Added/Updated/Skipped)
+    sourceUpdatedIso: safeIso,
     sourceUpdatedTs,
     sourceUpdatedMs,
 
@@ -609,9 +617,9 @@ function inferCompanyNameFromFeed(feed, source, jobsRaw) {
   return null;
 }
 
-// --------- NEW: batched getAll() for existing docs ----------
+// --------- batched getAll() for existing docs ----------
 async function getExistingUpdatedMsMap(docRefs) {
-  const out = new Map(); // docPath -> sourceUpdatedMs (number) or null
+  const out = new Map(); // docPath -> sourceUpdatedMs (number)
   for (let i = 0; i < docRefs.length; i += GETALL_CHUNK) {
     const chunk = docRefs.slice(i, i + GETALL_CHUNK);
     const snaps = await db.getAll(...chunk);
@@ -633,7 +641,7 @@ function isAlreadyExistsError(e) {
 }
 
 // Writes are only performed AFTER timestamp comparison
-async function writeJobIfNeeded({ bulkWriter, jobsColRef, ref, normalized, existingUpdatedMs }) {
+async function writeJobIfNeeded({ bulkWriter, ref, normalized, existingUpdatedMs }) {
   const incomingMs = normalized.sourceUpdatedMs;
 
   // New doc -> create
@@ -646,17 +654,16 @@ async function writeJobIfNeeded({ bulkWriter, jobsColRef, ref, normalized, exist
       });
       return { added: 1, updated: 0, skipped: 0 };
     } catch (e) {
-      // If create races, fall back to merge set ONLY IF incoming is newer than stored (we don't know stored here)
+      // race fallback
       if (!isAlreadyExistsError(e)) throw e;
       await bulkWriter.set(ref, normalized, { merge: true });
       return { added: 0, updated: 1, skipped: 0 };
     }
   }
 
-  // Existing doc: if it has no value, treat as update
   const prevMs = existingUpdatedMs ?? -1;
 
-  // Not newer -> skip write
+  // Not newer -> skip
   if (incomingMs <= prevMs) {
     return { added: 0, updated: 0, skipped: 1 };
   }
@@ -666,18 +673,27 @@ async function writeJobIfNeeded({ bulkWriter, jobsColRef, ref, normalized, exist
   return { added: 0, updated: 1, skipped: 0 };
 }
 
-async function processOneFeed(uid, feed, bulkWriter) {
+async function processOneFeed(uid, feed, bulkWriter, cutoffMs) {
   const source = feed.source || detectFeedSource(feed.url);
   const json = await fetchJson(feed.url);
 
   const jobsRaw = extractJobsFromFeedJson(source, json);
   const inferredCompanyName = inferCompanyNameFromFeed(feed, source, jobsRaw);
 
-  // filter by location rules (same as before)
+  // filter by location + last-1h window (key reduction)
   const keptRaw = [];
   for (const j of jobsRaw) {
+    // compute sourceUpdated using ORIGINAL job object (critical)
+    const iso = computeSourceUpdatedIso(source, j);
+    const ms = iso ? isoToMs(iso) : 0;
+
+    // if missing timestamp, treat as old -> ignore (prevents mass-updates)
+    if (!ms || ms < cutoffMs) continue;
+
     const loc = source === "greenhouse" ? j?.location?.name : j?.location;
-    if (!loc || shouldKeepJobByLocation(loc, j)) keptRaw.push(j);
+    if (!loc || shouldKeepJobByLocation(loc, j)) {
+      keptRaw.push({ jobRaw: j, sourceUpdatedIso: iso });
+    }
   }
 
   const companyKey = feedCompanyKey(feed);
@@ -685,22 +701,33 @@ async function processOneFeed(uid, feed, bulkWriter) {
 
   // Build normalized payloads + refs
   const incoming = [];
-  for (const jobRaw of keptRaw) {
+  for (const entry of keptRaw) {
+    const jobRaw = entry.jobRaw;
     const ghLike = toGreenhouseLikeJob(source, jobRaw);
-    const normalized = normalizeJob(uid, feed, ghLike, source);
+
+    // must have id
+    if (!ghLike?.id) continue;
+
+    const normalized = normalizeJob(uid, feed, ghLike, source, entry.sourceUpdatedIso);
     const docId = jobDocId(companyKey, ghLike.id);
     const ref = jobsCol.doc(docId);
     incoming.push({ ref, normalized });
   }
 
-  // --- NEW: 1 batched read phase (chunked) ---
-  // We need to know which docs exist + their stored sourceUpdatedMs
+  // If nothing in last 1h, we still upsert company and return quickly
+  if (incoming.length === 0) {
+    await upsertCompanyDoc(uid, feed, inferredCompanyName);
+    return { processed: 0, added: 0, updated: 0, skipped: 0 };
+  }
+
+  // 1 batched read phase (chunked)
   const refs = incoming.map((x) => x.ref);
   const existingMap = await getExistingUpdatedMsMap(refs);
 
-  // Perform writes only if needed
+  // Writes only if needed
   const limitWrite = pLimit(JOB_WRITE_CONCURRENCY);
 
+  let processed = incoming.length;
   let added = 0;
   let updated = 0;
   let skipped = 0;
@@ -713,7 +740,6 @@ async function processOneFeed(uid, feed, bulkWriter) {
 
         const res = await writeJobIfNeeded({
           bulkWriter,
-          jobsColRef: jobsCol,
           ref: x.ref,
           normalized: x.normalized,
           existingUpdatedMs,
@@ -728,12 +754,7 @@ async function processOneFeed(uid, feed, bulkWriter) {
 
   await upsertCompanyDoc(uid, feed, inferredCompanyName);
 
-  return {
-    processed: keptRaw.length,
-    added,
-    updated,
-    skipped,
-  };
+  return { processed, added, updated, skipped };
 }
 
 // ------------------------ FETCH RUN HELPERS ------------------------
@@ -764,7 +785,7 @@ function taskFunctionUri(functionName) {
   return `https://${REGION}-${projectId}.cloudfunctions.net/${functionName}`;
 }
 
-// ------------------------ ENQUEUE (used by BOTH manual + scheduled) ------------------------
+// ------------------------ ENQUEUE (manual + scheduled) ------------------------
 async function enqueueUserRun(uid, runType) {
   const { runId, ref } = await createFetchRun(uid, runType, "enqueued", {
     enqueuedAt: FieldValue.serverTimestamp(),
@@ -793,6 +814,8 @@ async function enqueueUserRun(uid, runType) {
 // ------------------------ TASK BODY ------------------------
 async function processUserFeeds(uid, runType, runId) {
   const startedAtMs = Date.now();
+  const cutoffMs = startedAtMs - WINDOW_MS;
+
   const feeds = await loadUserFeeds(uid);
   const runRef = fetchRunRef(uid, runId);
 
@@ -811,17 +834,23 @@ async function processUserFeeds(uid, runType, runId) {
       startedAt: FieldValue.serverTimestamp(),
       feedsCount: feeds.length,
       updatedAt: FieldValue.serverTimestamp(),
+
+      // counters
       processed: 0,
       added: 0,
       updated: 0,
       skipped: 0,
+
+      // window info
+      windowMs: WINDOW_MS,
+      cutoffMs,
+
       errorsCount: 0,
       errorSamples: [],
     },
     { merge: true }
   );
 
-  // Heartbeat: keeps UI updated while running
   const writeHeartbeat = async () => {
     await runRef.set(
       {
@@ -842,6 +871,8 @@ async function processUserFeeds(uid, runType, runId) {
   }, HEARTBEAT_EVERY_MS);
 
   const bulkWriter = db.bulkWriter();
+
+  // CRITICAL: log real error details
   bulkWriter.onWriteError((error) => {
     const code = error?.code;
     const retryable =
@@ -853,11 +884,9 @@ async function processUserFeeds(uid, runType, runId) {
 
     if (retryable && error.failedAttempts < 5) return true;
 
-    // IMPORTANT: log the real error object so you see the cause
     logger.error("BulkWriter write failed", {
       code,
       message: error?.message,
-      name: error?.name,
       failedAttempts: error?.failedAttempts,
       docPath: error?.documentRef?.path,
     });
@@ -871,7 +900,7 @@ async function processUserFeeds(uid, runType, runId) {
       feeds.map((feed) =>
         limitFeed(async () => {
           try {
-            const summary = await processOneFeed(uid, feed, bulkWriter);
+            const summary = await processOneFeed(uid, feed, bulkWriter, cutoffMs);
             processedTotal += summary.processed;
             addedTotal += summary.added;
             updatedTotal += summary.updated;
@@ -880,8 +909,7 @@ async function processUserFeeds(uid, runType, runId) {
             errorsCount += 1;
             const msg = String(err?.message || err);
 
-            // keep only a few samples so doc doesn't grow forever
-            if (errorSamples.length < 8) errorSamples.push(`${feed.url} :: ${msg}`);
+            if (errorSamples.length < 12) errorSamples.push(`${feed.url} :: ${msg}`);
 
             logger.warn("feed failed", { uid, url: feed.url, error: msg });
           }
@@ -899,10 +927,12 @@ async function processUserFeeds(uid, runType, runId) {
         finishedAt: FieldValue.serverTimestamp(),
         updatedAt: FieldValue.serverTimestamp(),
         durationMs,
+
         processed: processedTotal,
         added: addedTotal,
         updated: updatedTotal,
         skipped: skippedTotal,
+
         errorsCount,
         errorSamples,
       },
