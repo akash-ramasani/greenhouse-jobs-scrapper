@@ -737,3 +737,97 @@ function simpleChecksum(s) {
   }
   return h.toString(16);
 }
+
+/**
+ * =====================================================================================
+ * 🔥 MANUAL ADMIN TOOL: Delete all SpaceX jobs for a specific user
+ * =====================================================================================
+ *
+ * This Cloud Function lets you manually remove all job documents where
+ * `companyName === "SpaceX"` inside:
+ *
+ *    users/{userId}/jobs
+ *
+ * It supports a dry-run mode so you can safely preview how many docs
+ * *would* be deleted before actually deleting anything.
+ *
+ * -------------------------------------------------------------------------------------
+ * 📌 Usage:
+ *
+ *   1. Real deletion:
+ *      https://us-central1-<PROJECT_ID>.cloudfunctions.net/deleteSpacexJobs?userId=<UID>
+ *
+ *   2. Dry run (no writes, just counts):
+ *      https://us-central1-<PROJECT_ID>.cloudfunctions.net/deleteSpacexJobs?userId=<UID>&dryRun=true
+ *
+ * -------------------------------------------------------------------------------------
+ * ⚠️ Notes:
+ * - Uses BulkWriter for fast + safe batch deletion.
+ * - Timeout extended to 540s for large datasets.
+ * - CORS enabled so you can trigger from browser if needed.
+ * =====================================================================================
+ */
+
+exports.deleteSpacexJobs = onRequest(
+  { region: REGION, timeoutSeconds: 540, memory: "1GiB", cors: true },
+  async (req, res) => {
+    try {
+      // ------------------------------------------------------------
+      // 1. Validate userId
+      // ------------------------------------------------------------
+      const userId = String(req.query.userId || "").trim();
+      if (!userId) {
+        return res.status(400).json({ error: "Missing userId query param." });
+      }
+
+      // ------------------------------------------------------------
+      // 2. Check dry-run mode
+      // ------------------------------------------------------------
+      const dryRun = String(req.query.dryRun || "").toLowerCase() === "true";
+
+      // ------------------------------------------------------------
+      // 3. Query all SpaceX jobs for this user
+      // ------------------------------------------------------------
+      const jobsRef = db
+        .collection("users")
+        .doc(userId)
+        .collection("jobs")
+        .where("companyName", "==", "SpaceX");
+
+      const snap = await jobsRef.get();
+
+      let scanned = snap.size;
+      let deleted = 0;
+
+      // ------------------------------------------------------------
+      // 4. If NOT dry-run, delete using BulkWriter
+      // ------------------------------------------------------------
+      if (!dryRun) {
+        const bw = db.bulkWriter();
+
+        snap.docs.forEach((docSnap) => {
+          bw.delete(docSnap.ref);
+          deleted += 1;
+        });
+
+        await bw.close();
+      }
+
+      // ------------------------------------------------------------
+      // 5. Respond with summary
+      // ------------------------------------------------------------
+      return res.json({
+        ok: true,
+        userId,
+        dryRun,
+        scanned,
+        deleted,
+      });
+
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      logger.error("deleteSpacexJobs failed:", e);
+      return res.status(500).json({ error: msg });
+    }
+  }
+);
