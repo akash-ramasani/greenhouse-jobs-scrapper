@@ -1,3 +1,6 @@
+// src/pages/Home.jsx — NO `active` anywhere, and polling button removed.
+// Adds only feeds, archive/restore, and “Reset feeds” trigger.
+
 import React, { useEffect, useMemo, useState } from "react";
 import {
   addDoc,
@@ -17,7 +20,6 @@ const URL_RULES = {
   greenhouse: {
     label: "Greenhouse API Endpoint",
     placeholder: "https://boards-api.greenhouse.io/v1/boards/<company>/jobs",
-    // allow query params; keep strict https and correct host/path
     isValid: (u) =>
       /^https:\/\/boards-api\.greenhouse\.io\/v1\/boards\/[^/]+\/jobs(?:\?.*)?$/i.test(
         u
@@ -31,16 +33,15 @@ const URL_RULES = {
       /^https:\/\/api\.ashbyhq\.com\/posting-api\/job-board\/[^/?#]+(?:\?.*)?$/i.test(
         u
       ),
-    normalize: (u) => u.trim(), // keep case for company slug if any; duplicates checked lowercased
+    normalize: (u) => u.trim(),
   },
 };
 
-// Auto-detect type from URL (lets user paste a URL without picking type)
 function detectSourceFromUrl(raw) {
   const u = (raw || "").trim().toLowerCase();
   if (u.includes("boards-api.greenhouse.io/v1/boards/")) return "greenhouse";
   if (u.includes("api.ashbyhq.com/posting-api/job-board/")) return "ashby";
-  return "greenhouse"; // default
+  return "greenhouse";
 }
 
 function prettySourceLabel(source) {
@@ -71,17 +72,12 @@ export default function Home({ user }) {
   const [company, setCompany] = useState("");
   const [url, setUrl] = useState("");
   const [feeds, setFeeds] = useState([]);
-  const [busyNow, setBusyNow] = useState(false);
   const [busyArchiveId, setBusyArchiveId] = useState(null);
-
-  // NEW: bulk add button loading state
-  const [busyBulkAdd, setBusyBulkAdd] = useState(false);
+  const [busyReset, setBusyReset] = useState(false);
 
   useEffect(() => {
     const feedsRef = collection(db, "users", user.uid, "feeds");
     const qFeeds = query(feedsRef, orderBy("createdAt", "desc"));
-
-    // Instant updates after add/restore/archive without refresh.
     return onSnapshot(qFeeds, (snap) =>
       setFeeds(snap.docs.map((d) => ({ id: d.id, ...d.data() })))
     );
@@ -89,14 +85,12 @@ export default function Home({ user }) {
 
   const activeFeeds = useMemo(() => feeds.filter((f) => !f.archivedAt), [feeds]);
   const archivedFeeds = useMemo(() => feeds.filter((f) => !!f.archivedAt), [feeds]);
-
   const detectedSource = useMemo(() => detectSourceFromUrl(url), [url]);
 
   async function addFeed(e) {
     e.preventDefault();
     const cleanCompany = company.trim();
     const rawUrl = url.trim();
-
     if (!cleanCompany || !rawUrl) return;
 
     const source = detectSourceFromUrl(rawUrl);
@@ -118,12 +112,11 @@ export default function Home({ user }) {
       await addDoc(collection(db, "users", user.uid, "feeds"), {
         company: cleanCompany,
         url: v.normalizedUrl,
-        source, // optional; backend also auto-detects, but helpful for UI/debugging
+        source,
         createdAt: serverTimestamp(),
+        archivedAt: null,
         lastCheckedAt: null,
         lastError: null,
-        archivedAt: null,
-        active: true,
       });
 
       showToast(
@@ -138,18 +131,18 @@ export default function Home({ user }) {
     }
   }
 
-  async function fetchNow() {
-    setBusyNow(true);
+  async function resetFeeds() {
+    setBusyReset(true);
     try {
       const functions = getFunctions(undefined, "us-central1");
-      const callFn = httpsCallable(functions, "pollNowV2");
-      await callFn({});
-      showToast("Fetch started. New jobs will appear shortly.", "success");
+      const callFn = httpsCallable(functions, "resetFeedsV1");
+      const res = await callFn({});
+      showToast(res?.data?.message || "Feeds reset completed.", "success");
     } catch (e) {
       console.error(e);
-      showToast(e?.message || "Manual fetch failed.", "error");
+      showToast(e?.message || "Reset failed.", "error");
     } finally {
-      setBusyNow(false);
+      setBusyReset(false);
     }
   }
 
@@ -192,19 +185,22 @@ export default function Home({ user }) {
           </h2>
           <p className="mt-1 text-sm text-gray-500">
             Connect <span className="font-semibold">Greenhouse</span> and{" "}
-            <span className="font-semibold">AshbyHQ</span> job boards. Our system will automatically
-            monitor these for new opportunities.
+            <span className="font-semibold">AshbyHQ</span> job boards.
           </p>
 
           <div className="mt-6 flex flex-col gap-3 sm:flex-row sm:items-center">
             <button
-              onClick={fetchNow}
-              disabled={busyNow}
+              onClick={resetFeeds}
+              disabled={busyReset}
               className="btn-secondary w-full sm:w-auto uppercase tracking-widest text-[11px] font-black"
             >
-              {busyNow ? "Starting..." : "Check for new jobs now"}
+              {busyReset ? "Resetting..." : "Reset feeds (remove old fields)"}
             </button>
           </div>
+
+          <p className="mt-3 text-[11px] text-gray-400">
+            Reset keeps only: company, url, source, createdAt, archivedAt, lastCheckedAt, lastError.
+          </p>
         </div>
 
         <div className="md:col-span-2">
@@ -272,7 +268,7 @@ export default function Home({ user }) {
                 <span className="ml-1 text-indigo-700">({activeFeeds.length})</span>
               </h3>
               <p className="text-[11px] text-indigo-700 mt-1">
-                These feeds are monitored for new jobs.
+                These feeds are enabled (archivedAt is null).
               </p>
             </div>
           </div>
@@ -321,7 +317,7 @@ export default function Home({ user }) {
                 <span className="ml-1 text-gray-400">({archivedFeeds.length})</span>
               </h3>
               <p className="text-[11px] text-gray-500 mt-1">
-                Archived feeds are not monitored.
+                Archived feeds are not used (archivedAt is set).
               </p>
             </div>
           </div>

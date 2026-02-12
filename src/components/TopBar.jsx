@@ -43,7 +43,7 @@ export default function TopBar({ user, userMeta, page, setPage, onLogout }) {
               <div className="flex items-center gap-6">
                 <div className="hidden md:flex flex-col items-end">
                   <span className="text-sm font-semibold text-gray-900">
-                    {userMeta?.firstName || "User"}
+                    {userMeta?.fullName || "User"}
                   </span>
                   <button
                     onClick={handleLogoutClick} // Updated to use the wrapper

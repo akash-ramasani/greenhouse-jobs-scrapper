@@ -3,9 +3,13 @@ import React, { useEffect, useMemo, useState } from "react";
 import { db } from "../firebase";
 import { collection, query, orderBy, limit, onSnapshot } from "firebase/firestore";
 
-function fmtDateTime(ts) {
-  if (!ts?.toDate) return "—";
-  const d = ts.toDate();
+function fmtDateTime(tsOrDate) {
+  const d =
+    tsOrDate?.toDate ? tsOrDate.toDate() :
+    tsOrDate instanceof Date ? tsOrDate :
+    null;
+
+  if (!d || Number.isNaN(d.getTime())) return "—";
   return d.toLocaleString(undefined, {
     year: "numeric",
     month: "short",
@@ -15,9 +19,14 @@ function fmtDateTime(ts) {
   });
 }
 
-function fmtSince(ts) {
-  if (!ts?.toDate) return "—";
-  const d = ts.toDate();
+function fmtSince(tsOrDate) {
+  const d =
+    tsOrDate?.toDate ? tsOrDate.toDate() :
+    tsOrDate instanceof Date ? tsOrDate :
+    null;
+
+  if (!d || Number.isNaN(d.getTime())) return "—";
+
   const diffMs = Date.now() - d.getTime();
   const mins = Math.floor(diffMs / (1000 * 60));
   const hours = Math.floor(mins / 60);
@@ -39,14 +48,24 @@ function statusLabel(s) {
   return String(s || "done").toUpperCase();
 }
 
-// Prefer the most “truthy” timeline point for “Ran X ago”
-function pickRunTime(r) {
-  return r.startedAt || r.enqueuedAt || r.createdAt || r.updatedAt || null;
-}
-
 function metric(n) {
   return Number.isFinite(n) ? n : 0;
 }
+
+/**
+ * SyncRuns doc shape (new):
+ * {
+ *   ok: true/false,
+ *   userId: "...",
+ *   source: "syncRecentJobsHourly" | "runSyncNow" | ...,
+ *   ranAt: Firestore Timestamp,
+ *   scanned: number,
+ *   updated: number,
+ *   jobsWritten: number (optional),
+ *   recentCutoffIso: string (optional),
+ *   error: string (optional)
+ * }
+ */
 
 export default function FetchHistory({ user }) {
   const [runs, setRuns] = useState([]);
@@ -54,8 +73,11 @@ export default function FetchHistory({ user }) {
 
   useEffect(() => {
     if (!user?.uid) return;
-    const ref = collection(db, "users", user.uid, "fetchRuns");
-    const q = query(ref, orderBy("createdAt", "desc"), limit(60));
+
+    // ✅ NEW: users/{uid}/syncRuns
+    const ref = collection(db, "users", user.uid, "syncRuns");
+    const q = query(ref, orderBy("ranAt", "desc"), limit(60));
+
     return onSnapshot(q, (snap) => {
       setRuns(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
     });
@@ -66,21 +88,17 @@ export default function FetchHistory({ user }) {
   return (
     <div className="space-y-8 py-10" style={{ fontFamily: "Ubuntu, sans-serif" }}>
       <div>
-        <h1 className="text-2xl font-bold text-gray-900">Fetch History</h1>
+        <h1 className="text-2xl font-bold text-gray-900">Sync History</h1>
         <p className="mt-1 text-sm text-gray-600">
-          Logs for the “Last 1 Hour” ingestion window.
+          Logs for the “Last 65 Minutes” ingestion window (scheduler runs hourly).
         </p>
 
         <p className="mt-2 text-xs text-gray-500">
-          <span className="font-semibold">Found</span> = jobs after location filter.
+          <span className="font-semibold">Scanned</span> = jobs examined (from feeds / candidate pool).
           {" "}
-          <span className="font-semibold">Candidates</span> = jobs within the last 60 minutes.
+          <span className="font-semibold">Updated</span> = jobs written/merged to Firestore.
           {" "}
-          <span className="font-semibold">Added/Updated</span> = Firestore writes.
-          {" "}
-          <span className="font-semibold">Skipped (Old)</span> = older than 60 minutes.
-          {" "}
-          <span className="font-semibold">Skipped (Unchanged)</span> = not newer than what’s already stored.
+          <span className="font-semibold">Jobs Written</span> = optional field if your backend logs it separately.
         </p>
       </div>
 
@@ -93,38 +111,44 @@ export default function FetchHistory({ user }) {
           {runs.map((r) => {
             const isOpen = openId === r.id;
 
-            const runType = r.runType === "scheduled" ? "Scheduled" : "Manual";
+            // Determine run type from `source`
+            const source = String(r.source || "");
+            const runType =
+              source.toLowerCase().includes("manual") ||
+              source.toLowerCase().includes("runsyncnow") ||
+              source.toLowerCase().includes("http")
+                ? "Manual"
+                : "Scheduled";
+
             const badgeCls =
-              r.runType === "scheduled"
+              runType === "Scheduled"
                 ? "bg-gray-100 text-gray-700 ring-gray-200"
                 : "bg-indigo-50 text-indigo-700 ring-indigo-100";
 
-            const status = statusLabel(r.status);
+            // Status derived from ok + error
+            const status =
+              r.ok === true ? "DONE" :
+              r.ok === false ? "FAILED" :
+              "DONE";
+
             const statusCls =
               status === "DONE"
                 ? "text-green-700"
-                : status === "RUNNING" || status === "ENQUEUED"
-                ? "text-amber-700"
-                : status === "DONE_WITH_ERRORS" || status === "FAILED" || status === "ENQUEUE_FAILED"
+                : status === "FAILED"
                 ? "text-red-700"
                 : "text-gray-500";
 
-            const runTime = pickRunTime(r);
+            const ranAt = r.ranAt || null;
 
-            // ✅ Updated counter names from new backend
-            const feedsCount = metric(r.feedsCount);
-            const found = metric(r.found);
-            const candidates = metric(r.candidates);
-            const added = metric(r.added);
+            const scanned = metric(r.scanned);
             const updated = metric(r.updated);
-            const writes = metric(r.writes) || added + updated;
+            const jobsWritten = metric(r.jobsWritten) || updated;
 
-            const skippedOld = metric(r.skippedOld);
-            const skippedUnchanged = metric(r.skippedUnchanged);
-            const noTimestamp = metric(r.noTimestamp);
+            const durationMs = r.durationMs; // optional if you add it later
+            const recentCutoffIso = r.recentCutoffIso || "";
+            const recentCutoffDisplay = recentCutoffIso ? fmtDateTime(new Date(recentCutoffIso)) : "—";
 
-            const errorsCount = metric(r.errorsCount);
-            const durationMs = r.durationMs;
+            const hasError = Boolean(r.error) || r.ok === false;
 
             return (
               <li key={r.id} className="px-4 py-5 sm:px-6 hover:bg-gray-50 transition-colors">
@@ -138,161 +162,110 @@ export default function FetchHistory({ user }) {
                       </span>
 
                       <span className="text-sm font-semibold text-gray-900">
-                        Ran {fmtSince(runTime)}
+                        Ran {fmtSince(ranAt)}
                       </span>
 
                       <span className="text-gray-300">|</span>
 
-                      <span className="text-sm text-gray-600">{fmtDateTime(runTime)}</span>
+                      <span className="text-sm text-gray-600">{fmtDateTime(ranAt)}</span>
 
                       <span className="text-gray-300">|</span>
 
                       <span className={`text-xs font-black uppercase tracking-widest ${statusCls}`}>
-                        {status}
+                        {statusLabel(status)}
                       </span>
                     </div>
 
                     {/* Topline summary */}
                     <div className="mt-2 text-sm text-gray-700">
-                      Feeds <span className="font-semibold">{feedsCount}</span>
-                      {" "}• Found <span className="font-semibold">{found}</span>
-                      {" "}• Candidates <span className="font-semibold">{candidates}</span>
-                      {" "}• Writes <span className="font-semibold">{writes}</span>
+                      Scanned <span className="font-semibold">{scanned}</span>
+                      {" "}• Updated <span className="font-semibold">{updated}</span>
+                      {" "}• Jobs Written <span className="font-semibold">{jobsWritten}</span>
+                      {" "}• Cutoff <span className="font-semibold">{recentCutoffDisplay}</span>
                       {" "}• Duration <span className="font-semibold">{fmtDuration(durationMs)}</span>
                     </div>
 
-                    {/* Mini cards like your screenshot */}
+                    {/* Mini cards */}
                     <div className="mt-4 grid grid-cols-2 sm:grid-cols-4 gap-3">
                       <div className="rounded-lg ring-1 ring-inset ring-gray-200 bg-white p-3">
                         <div className="text-[10px] font-black uppercase tracking-widest text-gray-400">
-                          Skipped (Old)
+                          Scanned
                         </div>
-                        <div className="mt-1 text-lg font-extrabold text-gray-900">{skippedOld}</div>
+                        <div className="mt-1 text-lg font-extrabold text-gray-900">{scanned}</div>
                       </div>
 
                       <div className="rounded-lg ring-1 ring-inset ring-gray-200 bg-white p-3">
                         <div className="text-[10px] font-black uppercase tracking-widest text-gray-400">
-                          No Timestamp
+                          Updated
                         </div>
-                        <div className="mt-1 text-lg font-extrabold text-gray-900">{noTimestamp}</div>
+                        <div className="mt-1 text-lg font-extrabold text-gray-900">{updated}</div>
                       </div>
 
                       <div className="rounded-lg ring-1 ring-inset ring-gray-200 bg-white p-3">
                         <div className="text-[10px] font-black uppercase tracking-widest text-gray-400">
-                          Unchanged
+                          Jobs Written
                         </div>
-                        <div className="mt-1 text-lg font-extrabold text-gray-900">{skippedUnchanged}</div>
+                        <div className="mt-1 text-lg font-extrabold text-gray-900">{jobsWritten}</div>
                       </div>
 
                       <div className="rounded-lg ring-1 ring-inset ring-gray-200 bg-white p-3">
                         <div className="text-[10px] font-black uppercase tracking-widest text-gray-400">
-                          Writes
+                          Result
                         </div>
-                        <div className="mt-1 text-lg font-extrabold text-indigo-700">{writes}</div>
+                        <div className={`mt-1 text-lg font-extrabold ${hasError ? "text-red-700" : "text-green-700"}`}>
+                          {hasError ? "Error" : "OK"}
+                        </div>
                       </div>
                     </div>
 
                     {isOpen && (
                       <div className="mt-5 space-y-4">
-                        {(status === "RUNNING" || status === "ENQUEUED") && (
-                          <div className="rounded-lg bg-amber-50 ring-1 ring-inset ring-amber-100 p-4">
-                            <div className="text-xs font-bold uppercase tracking-widest text-amber-700">
-                              In progress
-                            </div>
-                            <div className="mt-2 text-sm text-amber-800">
-                              This run is still updating. Counters may change while it runs.
-                            </div>
-                          </div>
-                        )}
-
-                        {errorsCount > 0 ? (
+                        {hasError ? (
                           <div className="rounded-lg bg-red-50 ring-1 ring-inset ring-red-100 p-4">
                             <div className="text-xs font-bold uppercase tracking-widest text-red-700">
-                              Errors detected
+                              Error
                             </div>
 
-                            <div className="mt-2 text-sm text-gray-700">
-                              Errors count: <span className="font-semibold">{errorsCount}</span>
+                            <div className="mt-3 text-xs text-red-800 font-mono whitespace-pre-wrap break-words">
+                              {String(r.error || "Unknown error")}
                             </div>
-
-                            {r.enqueueError ? (
-                              <div className="mt-3 text-xs text-red-800 font-mono whitespace-pre-wrap break-words">
-                                {r.enqueueError}
-                              </div>
-                            ) : null}
-
-                            {r.error ? (
-                              <div className="mt-3 text-xs text-red-800 font-mono whitespace-pre-wrap break-words">
-                                {r.error}
-                              </div>
-                            ) : null}
-
-                            {Array.isArray(r.errorSamples) && r.errorSamples.length > 0 ? (
-                              <div className="mt-4">
-                                <div className="text-[11px] font-black uppercase tracking-widest text-red-700">
-                                  Error samples
-                                </div>
-                                <ul className="mt-2 space-y-2">
-                                  {r.errorSamples.slice(0, 12).map((e, idx) => (
-                                    <li
-                                      key={idx}
-                                      className="text-xs font-mono text-red-900 whitespace-pre-wrap break-words"
-                                    >
-                                      {e}
-                                    </li>
-                                  ))}
-                                </ul>
-                              </div>
-                            ) : null}
                           </div>
                         ) : (
-                          status !== "RUNNING" &&
-                          status !== "ENQUEUED" && (
-                            <div className="rounded-lg bg-green-50 ring-1 ring-inset ring-green-100 p-4">
-                              <div className="text-xs font-bold uppercase tracking-widest text-green-700">
-                                No errors in this run
-                              </div>
-                              <div className="mt-2 text-sm text-green-800">
-                                All feeds completed successfully.
-                              </div>
+                          <div className="rounded-lg bg-green-50 ring-1 ring-inset ring-green-100 p-4">
+                            <div className="text-xs font-bold uppercase tracking-widest text-green-700">
+                              No errors in this run
                             </div>
-                          )
+                            <div className="mt-2 text-sm text-green-800">
+                              Sync completed successfully.
+                            </div>
+                          </div>
                         )}
 
-                        {/* Timeline */}
+                        {/* Details */}
                         <div className="rounded-lg bg-white ring-1 ring-inset ring-gray-200 p-4">
                           <div className="text-[11px] font-black uppercase tracking-widest text-gray-600">
-                            Timeline
+                            Details
                           </div>
 
                           <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm text-gray-700">
                             <div>
-                              Created: <span className="font-semibold">{fmtDateTime(r.createdAt)}</span>
+                              Source: <span className="font-semibold">{source || "—"}</span>
                             </div>
                             <div>
-                              Enqueued: <span className="font-semibold">{fmtDateTime(r.enqueuedAt)}</span>
+                              UserId: <span className="font-semibold">{r.userId || user.uid}</span>
                             </div>
                             <div>
-                              Started: <span className="font-semibold">{fmtDateTime(r.startedAt)}</span>
+                              Ran At: <span className="font-semibold">{fmtDateTime(ranAt)}</span>
                             </div>
                             <div>
-                              Finished: <span className="font-semibold">{fmtDateTime(r.finishedAt)}</span>
+                              Recent Cutoff: <span className="font-semibold">{recentCutoffDisplay}</span>
                             </div>
                           </div>
 
-                          {/* Optional backend debug fields */}
-                          {typeof r.windowMs === "number" ? (
+                          {typeof r.jobsWritten === "number" ? (
                             <div className="mt-3 text-xs text-gray-600">
-                              Window:{" "}
-                              <span className="font-semibold">{Math.round(r.windowMs / 60000)} min</span>
-                              {typeof r.cutoffMs === "number" ? (
-                                <>
-                                  {" "}• Cutoff:{" "}
-                                  <span className="font-semibold">
-                                    {new Date(r.cutoffMs).toLocaleString()}
-                                  </span>
-                                </>
-                              ) : null}
+                              Note: <span className="font-semibold">jobsWritten</span> is optional — if missing, UI uses{" "}
+                              <span className="font-semibold">updated</span>.
                             </div>
                           ) : null}
                         </div>
@@ -305,16 +278,13 @@ export default function FetchHistory({ user }) {
                           <div className="mt-2 text-sm text-indigo-900/90 leading-relaxed">
                             <ul className="list-disc pl-5 space-y-1">
                               <li>
-                                <span className="font-semibold">Found</span> is after location filtering.
+                                <span className="font-semibold">Scanned</span> is how many job records were evaluated.
                               </li>
                               <li>
-                                <span className="font-semibold">Candidates</span> are only jobs updated/published within the last hour.
+                                <span className="font-semibold">Updated</span> is how many job docs were written (merge/upsert).
                               </li>
                               <li>
-                                <span className="font-semibold">Skipped (Old)</span> means the job was outside the 1-hour window, so it was ignored.
-                              </li>
-                              <li>
-                                <span className="font-semibold">Unchanged</span> means the job existed in Firestore and wasn’t newer, so no write.
+                                <span className="font-semibold">Cutoff</span> shows the start of the “recent window” used by the sync.
                               </li>
                             </ul>
                           </div>
@@ -328,7 +298,7 @@ export default function FetchHistory({ user }) {
                     className={`text-xs font-bold uppercase tracking-wider ${
                       isOpen
                         ? "text-gray-600 hover:text-gray-900"
-                        : errorsCount > 0 || status === "FAILED" || status === "ENQUEUE_FAILED"
+                        : hasError
                         ? "text-red-600 hover:text-red-800"
                         : "text-indigo-600 hover:text-indigo-800"
                     }`}
@@ -342,7 +312,7 @@ export default function FetchHistory({ user }) {
 
           {!runs.length && (
             <li className="px-4 py-12 text-center text-sm text-gray-500">
-              No fetch runs yet.
+              No sync runs yet.
             </li>
           )}
         </ul>
@@ -350,9 +320,8 @@ export default function FetchHistory({ user }) {
 
       {openRun ? (
         <div className="text-xs text-gray-500">
-          Note: With the “last 1 hour” ingestion window,{" "}
-          <span className="font-semibold">Candidates</span> should usually be much smaller than{" "}
-          <span className="font-semibold">Found</span>.
+          Note: With a “last 65 minutes” ingestion window,{" "}
+          <span className="font-semibold">Updated</span> may be small when there are no new jobs.
         </div>
       ) : null}
     </div>

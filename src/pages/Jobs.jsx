@@ -51,11 +51,9 @@ function timeAgoFromFirestore(ts) {
   return "just now";
 }
 
-function shortAgoFromISO(iso) {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
-  const diffMs = Date.now() - d.getTime();
+function shortAgoFromDate(date) {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return "—";
+  const diffMs = Date.now() - date.getTime();
   const mins = Math.floor(diffMs / (1000 * 60));
   const hours = Math.floor(mins / 60);
   const days = Math.floor(hours / 24);
@@ -72,6 +70,20 @@ function timeframeToThresholdTs(timeframe) {
   if (!hours) return null;
   const ms = hours * 60 * 60 * 1000;
   return Timestamp.fromDate(new Date(Date.now() - ms));
+}
+
+// Try to extract state codes from location tokens / string (fallback only)
+function extractStateCodesFromLocationTokens(tokensOrString) {
+  const tokens = Array.isArray(tokensOrString) ? tokensOrString : [tokensOrString].filter(Boolean);
+  const found = new Set();
+  for (const t of tokens) {
+    const upper = String(t || "").toUpperCase();
+    const matches = upper.match(/\b[A-Z]{2}\b/g) || [];
+    for (const m of matches) {
+      if (US_STATES.some((s) => s.code === m)) found.add(m);
+    }
+  }
+  return Array.from(found);
 }
 
 export default function Jobs({ user }) {
@@ -93,7 +105,9 @@ export default function Jobs({ user }) {
 
   const observer = useRef(null);
 
-  // Load companies alphabetical
+  /**
+   * Companies (now created by sync in users/{uid}/companies/{feedId})
+   */
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -102,7 +116,6 @@ export default function Jobs({ user }) {
         const qCompanies = query(companiesRef, orderBy("companyName", "asc"), limit(500));
         const snap = await getDocs(qCompanies);
         const list = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-
         if (!cancelled) setCompanies(list);
       } catch (e) {
         console.error("Load companies error:", e);
@@ -111,13 +124,20 @@ export default function Jobs({ user }) {
     return () => { cancelled = true; };
   }, [user.uid]);
 
+  /**
+   * Fetch jobs
+   *
+   * Updated to match your new Firestore schema:
+   * - collection: users/{uid}/jobs
+   * - sort/filter: sourceUpdatedTs
+   * - company filter: companyKey
+   */
   const fetchJobs = useCallback(
     async (isFirstPage = true) => {
       setLoading(true);
       setIsProcessing(true);
 
       try {
-        // DIRECT collection access is better than collectionGroup for user-specific data
         const jobsCol = collection(db, "users", user.uid, "jobs");
         const constraints = [];
 
@@ -125,12 +145,11 @@ export default function Jobs({ user }) {
           constraints.push(where("companyKey", "in", selectedKeys.slice(0, 10)));
         }
 
-        // UPDATED: Using sourceUpdatedTs from your new index.js
+        // ✅ canonical sort field from index.js
         constraints.push(orderBy("sourceUpdatedTs", "desc"));
 
         if (timeframe !== "all") {
           const thresholdTs = timeframeToThresholdTs(timeframe);
-          // UPDATED: Using sourceUpdatedTs
           if (thresholdTs) constraints.push(where("sourceUpdatedTs", ">=", thresholdTs));
         }
 
@@ -140,11 +159,43 @@ export default function Jobs({ user }) {
         const qJobs = query(jobsCol, ...constraints);
         const snap = await getDocs(qJobs);
 
-        const docs = snap.docs.map((d) => ({
-          id: d.id,
-          ...d.data(),
-          _path: d.ref.path,
-        }));
+        const docs = snap.docs.map((d) => {
+          const data = d.data();
+
+          const locationName =
+            data.locationName ||
+            (Array.isArray(data.locationTokens) ? data.locationTokens[0] : "") ||
+            "Remote";
+
+          const companyName = data.companyName || "Unknown";
+
+          const stateCodes =
+            Array.isArray(data.stateCodes) && data.stateCodes.length > 0
+              ? data.stateCodes
+              : extractStateCodesFromLocationTokens(data.locationTokens || locationName);
+
+          // display updated = sourceUpdatedTs
+          const updatedShort =
+            data.sourceUpdatedTs?.toDate ? shortAgoFromDate(data.sourceUpdatedTs.toDate()) : "—";
+
+          return {
+            id: d.id,
+            ...data,
+
+            companyName,
+            locationName,
+            stateCodes,
+
+            // link priority: jobUrl -> applyUrl -> "#"
+            absolute_url: data.jobUrl || data.applyUrl || "#",
+
+            // discovered time (prefer firstSeenAt, fallback fetchedAt)
+            firstSeenAt: data.firstSeenAt || data.fetchedAt || null,
+
+            _updatedShort: updatedShort,
+            _path: d.ref.path,
+          };
+        });
 
         setJobs((prev) => (isFirstPage ? docs : [...prev, ...docs]));
         setLastDoc(snap.docs[snap.docs.length - 1] || null);
@@ -168,6 +219,7 @@ export default function Jobs({ user }) {
     setJobs([]);
     setHasMore(true);
     fetchJobs(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedKeys, timeframe]);
 
   const lastElementRef = useCallback(
@@ -207,6 +259,11 @@ export default function Jobs({ user }) {
     }
   };
 
+  /**
+   * Client-side filters:
+   * - titleSearch
+   * - stateFilter (stateCodes preferred)
+   */
   const filteredJobs = useMemo(() => {
     const titleTerm = titleSearch.trim().toLowerCase();
 
@@ -214,11 +271,9 @@ export default function Jobs({ user }) {
       if (titleTerm && !j.title?.toLowerCase().includes(titleTerm)) return false;
 
       if (stateFilter) {
-        // UPDATED: Using stateCodes array from index.js for more accurate filtering
         if (Array.isArray(j.stateCodes)) {
           if (!j.stateCodes.includes(stateFilter)) return false;
         } else {
-          // Fallback to text matching
           const location = (j.locationName || "").trim().toUpperCase();
           const stateRegex = new RegExp(`(?:^|[^A-Z])${stateFilter}(?:$|[^A-Z])`);
           if (!stateRegex.test(location)) return false;
@@ -241,8 +296,7 @@ export default function Jobs({ user }) {
   }, [filteredJobs, selectedKeys, timeframe]);
 
   const renderJobItem = (job) => {
-    // UPDATED: Use sourceUpdatedIso and sourceUpdatedTs
-    const updatedShort = shortAgoFromISO(job.sourceUpdatedIso);
+    const updatedShort = job._updatedShort || "—";
 
     return (
       <li
@@ -269,7 +323,6 @@ export default function Jobs({ user }) {
             </h3>
 
             <div className="mt-1 text-xs text-gray-400 flex flex-wrap items-center gap-x-3 gap-y-1">
-              {/* UPDATED: Using firstSeenAt and sourceUpdatedTs */}
               <span>Discovered {timeAgoFromFirestore(job.firstSeenAt)}</span>
               <span className="sm:hidden inline-flex items-center gap-1">
                 <span className="text-gray-300">•</span>
