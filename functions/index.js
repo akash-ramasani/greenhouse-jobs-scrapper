@@ -14,7 +14,10 @@
  *
  * ✅ Run summary saved to Firestore:
  * - users/{uid}/syncRuns/{runId}
- *   includes startedAt, finishedAt, durationMs
+ *   includes startedAt, finishedAt, durationMs, feedsCount
+ *
+ * ✅ Manual admin tool:
+ * - deleteSpacexJobs?userId=... deletes all SpaceX jobs for a user
  *
  * ⚠️ Firestore TTL must be enabled on field "expireAt" for collection group "jobs"
  */
@@ -125,7 +128,6 @@ exports.syncRecentJobsHourly = onSchedule(
       const runId = String(startedAt.toMillis());
       const runRef = db.collection("users").doc(userId).collection("syncRuns").doc(runId);
 
-      // Write "RUNNING" immediately so your UI can show progress if you want later
       await runRef.set(
         {
           ok: true,
@@ -153,13 +155,15 @@ exports.syncRecentJobsHourly = onSchedule(
             finishedAt,
             durationMs,
 
-            // your preferred counters
             ok: true,
             scanned: summary.jobsFetched,
             updated: summary.jobsWritten,
             jobsWritten: summary.jobsWritten,
 
-            // extra breakdown (optional but useful)
+            // ✅ NEW
+            feedsCount: summary.feedsCount,
+
+            // extra breakdown (optional)
             feedsProcessed: summary.feedsProcessed,
             failedFeeds: summary.failedFeeds,
             jobsFetched: summary.jobsFetched,
@@ -181,6 +185,9 @@ exports.syncRecentJobsHourly = onSchedule(
             error: msg,
             finishedAt,
             durationMs,
+
+            // ✅ NEW (still set something predictable)
+            feedsCount: 0,
           },
           { merge: true }
         );
@@ -240,6 +247,10 @@ exports.runSyncNow = onRequest(
         scanned: summary.jobsFetched,
         updated: summary.jobsWritten,
         removedFields: REMOVED_FIELDS,
+
+        // ✅ NEW
+        feedsCount: summary.feedsCount,
+
         ranAt: startedAt,
         recentCutoffIso: recentCutoff.toDate().toISOString(),
         finishedAt,
@@ -257,6 +268,9 @@ exports.runSyncNow = onRequest(
           scanned: summary.jobsFetched,
           updated: summary.jobsWritten,
           jobsWritten: summary.jobsWritten,
+
+          // ✅ NEW
+          feedsCount: summary.feedsCount,
 
           feedsProcessed: summary.feedsProcessed,
           failedFeeds: summary.failedFeeds,
@@ -281,6 +295,9 @@ exports.runSyncNow = onRequest(
           error: msg,
           finishedAt,
           durationMs,
+
+          // ✅ NEW
+          feedsCount: 0,
         },
         { merge: true }
       );
@@ -304,9 +321,12 @@ async function syncUserRecentJobs({ userId, now, recentCutoff }) {
     .get();
 
   const feeds = feedsSnap.docs.map((d) => ({ id: d.id, ...d.data() }));
-  if (feeds.length === 0) {
+  const feedsCount = feeds.length;
+
+  if (feedsCount === 0) {
     return {
       ok: true,
+      feedsCount,
       feedsProcessed: 0,
       failedFeeds: 0,
       jobsFetched: 0,
@@ -379,7 +399,6 @@ async function syncUserRecentJobs({ userId, now, recentCutoff }) {
           const baseTs = job.sourceUpdatedTs || now;
           const expireAt = addDaysTs(baseTs, TTL_DAYS);
 
-          // ✅ Only write fields we keep
           bw.set(
             jobRef,
             {
@@ -422,6 +441,7 @@ async function syncUserRecentJobs({ userId, now, recentCutoff }) {
 
   return {
     ok: true,
+    feedsCount,
     feedsProcessed,
     failedFeeds,
     jobsFetched,
@@ -743,51 +763,21 @@ function simpleChecksum(s) {
  * 🔥 MANUAL ADMIN TOOL: Delete all SpaceX jobs for a specific user
  * =====================================================================================
  *
- * This Cloud Function lets you manually remove all job documents where
- * `companyName === "SpaceX"` inside:
- *
- *    users/{userId}/jobs
- *
- * It supports a dry-run mode so you can safely preview how many docs
- * *would* be deleted before actually deleting anything.
- *
- * -------------------------------------------------------------------------------------
- * 📌 Usage:
- *
- *   1. Real deletion:
- *      https://us-central1-<PROJECT_ID>.cloudfunctions.net/deleteSpacexJobs?userId=<UID>
- *
- *   2. Dry run (no writes, just counts):
- *      https://us-central1-<PROJECT_ID>.cloudfunctions.net/deleteSpacexJobs?userId=<UID>&dryRun=true
- *
- * -------------------------------------------------------------------------------------
- * ⚠️ Notes:
- * - Uses BulkWriter for fast + safe batch deletion.
- * - Timeout extended to 540s for large datasets.
- * - CORS enabled so you can trigger from browser if needed.
- * =====================================================================================
+ * Usage:
+ *   https://us-central1-<PROJECT_ID>.cloudfunctions.net/deleteSpacexJobs?userId=<UID>
+ *   https://us-central1-<PROJECT_ID>.cloudfunctions.net/deleteSpacexJobs?userId=<UID>&dryRun=true
  */
-
 exports.deleteSpacexJobs = onRequest(
   { region: REGION, timeoutSeconds: 540, memory: "1GiB", cors: true },
   async (req, res) => {
     try {
-      // ------------------------------------------------------------
-      // 1. Validate userId
-      // ------------------------------------------------------------
       const userId = String(req.query.userId || "").trim();
       if (!userId) {
         return res.status(400).json({ error: "Missing userId query param." });
       }
 
-      // ------------------------------------------------------------
-      // 2. Check dry-run mode
-      // ------------------------------------------------------------
       const dryRun = String(req.query.dryRun || "").toLowerCase() === "true";
 
-      // ------------------------------------------------------------
-      // 3. Query all SpaceX jobs for this user
-      // ------------------------------------------------------------
       const jobsRef = db
         .collection("users")
         .doc(userId)
@@ -796,26 +786,18 @@ exports.deleteSpacexJobs = onRequest(
 
       const snap = await jobsRef.get();
 
-      let scanned = snap.size;
+      const scanned = snap.size;
       let deleted = 0;
 
-      // ------------------------------------------------------------
-      // 4. If NOT dry-run, delete using BulkWriter
-      // ------------------------------------------------------------
       if (!dryRun) {
         const bw = db.bulkWriter();
-
-        snap.docs.forEach((docSnap) => {
+        for (const docSnap of snap.docs) {
           bw.delete(docSnap.ref);
           deleted += 1;
-        });
-
+        }
         await bw.close();
       }
 
-      // ------------------------------------------------------------
-      // 5. Respond with summary
-      // ------------------------------------------------------------
       return res.json({
         ok: true,
         userId,
@@ -823,7 +805,6 @@ exports.deleteSpacexJobs = onRequest(
         scanned,
         deleted,
       });
-
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       logger.error("deleteSpacexJobs failed:", e);
